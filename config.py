@@ -1,4 +1,4 @@
-BOT_TOKEN = "8258014137:AAHJf4gXJEJ8sJsg-CClWVuifB-PqsdFv4A"
+BOT_TOKEN = "8670560280:AAG7qMFvsn90Xo8sSWml51v96HKHUcSV0hE"
 
 # Replace with your Telegram numeric user IDs.
 ADMIN_IDS = {7533495029}
