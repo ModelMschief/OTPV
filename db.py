@@ -4,7 +4,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from config import DATABASE_NAME, DEFAULT_ORDER_TIMEOUT_MINUTES, DEFAULT_OTP_PRICE
+from config import DATABASE_NAME, DEFAULT_ORDER_TIMEOUT_MINUTES, MIN_WITHDRAW_BDT, OTP_REWARD_BDT
 
 
 def utc_now_iso() -> str:
@@ -32,6 +32,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     balance REAL NOT NULL DEFAULT 0,
+                    wallet_address TEXT,
                     banned INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 )
@@ -70,10 +71,25 @@ class Database:
             cursor.execute(
                 """
                 INSERT INTO settings (id, free_mode, otp_price, order_timeout_minutes)
-                VALUES (1, 1, ?, ?)
+                VALUES (1, 1, 0.25, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
-                (DEFAULT_OTP_PRICE, DEFAULT_ORDER_TIMEOUT_MINUTES),
+                (DEFAULT_ORDER_TIMEOUT_MINUTES,),
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS withdrawals (
+                    withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    address TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT,
+                    admin_id INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+                """
             )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status)"
@@ -81,7 +97,22 @@ class Database:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_orders_number_status ON orders(number, status)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status ON withdrawals(user_id, status)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_withdrawals_status_created ON withdrawals(status, created_at)"
+            )
+            self._ensure_column_sync("users", "wallet_address", "TEXT")
             self.conn.commit()
+
+    def _ensure_column_sync(self, table_name: str, column_name: str, column_sql: str) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
     def _fetchone(self, query: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         with self.lock:
@@ -139,27 +170,11 @@ class Database:
         row = await asyncio.to_thread(self._fetchone, "SELECT * FROM settings WHERE id = 1")
         if not row:
             return {
-                "free_mode": True,
-                "otp_price": DEFAULT_OTP_PRICE,
                 "order_timeout_minutes": DEFAULT_ORDER_TIMEOUT_MINUTES,
             }
         return {
-            "free_mode": bool(row["free_mode"]),
-            "otp_price": float(row["otp_price"]),
             "order_timeout_minutes": int(row["order_timeout_minutes"]),
         }
-
-    async def set_free_mode(self, enabled: bool) -> None:
-        await asyncio.to_thread(
-            self._execute,
-            "UPDATE settings SET free_mode = ? WHERE id = 1",
-            (1 if enabled else 0,),
-        )
-
-    async def set_otp_price(self, price: float) -> None:
-        await asyncio.to_thread(
-            self._execute, "UPDATE settings SET otp_price = ? WHERE id = 1", (price,)
-        )
 
     async def set_order_timeout(self, minutes: int) -> None:
         await asyncio.to_thread(
@@ -171,6 +186,17 @@ class Database:
     async def get_balance(self, user_id: int) -> float:
         user = await self.get_user(user_id)
         return float(user["balance"]) if user else 0.0
+
+    async def get_wallet_address(self, user_id: int) -> str | None:
+        user = await self.get_user(user_id)
+        return str(user["wallet_address"]).strip() if user and user.get("wallet_address") else None
+
+    async def set_wallet_address(self, user_id: int, address: str) -> None:
+        await asyncio.to_thread(
+            self._execute,
+            "UPDATE users SET wallet_address = ? WHERE user_id = ?",
+            (address.strip(), user_id),
+        )
 
     async def add_balance(self, user_id: int, amount: float) -> float:
         await asyncio.to_thread(self._add_balance_sync, user_id, amount)
@@ -202,7 +228,7 @@ class Database:
     async def count_active_orders(self, user_id: int) -> int:
         row = await asyncio.to_thread(
             self._fetchone,
-            "SELECT COUNT(*) AS total FROM orders WHERE user_id = ? AND status IN ('waiting_otp', 'otp_locked')",
+            "SELECT COUNT(*) AS total FROM orders WHERE user_id = ? AND status = 'waiting_otp'",
             (user_id,),
         )
         return int(row["total"]) if row else 0
@@ -267,7 +293,7 @@ class Database:
         else:
             query = """
                 SELECT * FROM orders
-                WHERE user_id = ? AND status IN ('waiting_otp', 'otp_locked')
+                WHERE user_id = ? AND status = 'waiting_otp'
                 ORDER BY created_at DESC LIMIT ?
             """
         return await asyncio.to_thread(self._fetchall, query, (user_id, limit))
@@ -277,7 +303,7 @@ class Database:
             self._fetchall,
             """
             SELECT * FROM orders
-            WHERE status IN ('waiting_otp', 'otp_locked')
+            WHERE status = 'waiting_otp'
             ORDER BY created_at DESC LIMIT ?
             """,
             (limit,),
@@ -294,7 +320,7 @@ class Database:
                 """
                 UPDATE orders
                 SET status = 'cancelled', completed_at = ?, updated_at = ?
-                WHERE order_id = ? AND status IN ('waiting_otp', 'otp_locked')
+                WHERE order_id = ? AND status = 'waiting_otp'
                 """,
                 (now, now, order_id),
             )
@@ -347,8 +373,8 @@ class Database:
             ).fetchone()
             if not row:
                 return None
-            status = "otp_locked" if float(row["price"]) > 0 else "completed"
-            completed_at = None if status == "otp_locked" else received_at
+            status = "completed"
+            completed_at = received_at
             self.conn.execute(
                 """
                 UPDATE orders
@@ -366,49 +392,15 @@ class Database:
                     row["order_id"],
                 ),
             )
+            self.conn.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                (OTP_REWARD_BDT, row["user_id"]),
+            )
             self.conn.commit()
             updated = self.conn.execute(
                 "SELECT * FROM orders WHERE order_id = ?", (row["order_id"],)
             ).fetchone()
         return dict(updated) if updated else None
-
-    async def unlock_order(self, order_id: int, user_id: int) -> tuple[bool, str, dict[str, Any] | None]:
-        return await asyncio.to_thread(self._unlock_order_sync, order_id, user_id)
-
-    def _unlock_order_sync(self, order_id: int, user_id: int) -> tuple[bool, str, dict[str, Any] | None]:
-        now = utc_now_iso()
-        with self.lock:
-            order = self.conn.execute(
-                """
-                SELECT * FROM orders
-                WHERE order_id = ? AND user_id = ? AND status = 'otp_locked'
-                """,
-                (order_id, user_id),
-            ).fetchone()
-            if not order:
-                return False, "Order is not available for unlocking.", None
-            user = self.conn.execute(
-                "SELECT balance FROM users WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if not user or float(user["balance"]) < float(order["price"]):
-                return False, "Insufficient balance.", None
-            self.conn.execute(
-                "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                (order["price"], user_id),
-            )
-            self.conn.execute(
-                """
-                UPDATE orders
-                SET status = 'completed', completed_at = ?, updated_at = ?
-                WHERE order_id = ?
-                """,
-                (now, now, order_id),
-            )
-            self.conn.commit()
-            updated = self.conn.execute(
-                "SELECT * FROM orders WHERE order_id = ?", (order_id,)
-            ).fetchone()
-        return True, "OTP unlocked successfully.", dict(updated) if updated else None
 
     async def user_stats(self, user_id: int) -> dict[str, Any]:
         return await asyncio.to_thread(self._user_stats_sync, user_id)
@@ -420,7 +412,7 @@ class Database:
                 SELECT
                     COUNT(*) AS total_orders,
                     SUM(CASE WHEN otp_message IS NOT NULL THEN 1 ELSE 0 END) AS successful_otps,
-                    SUM(CASE WHEN status IN ('waiting_otp', 'otp_locked') THEN 1 ELSE 0 END) AS active_orders
+                    SUM(CASE WHEN status = 'waiting_otp' THEN 1 ELSE 0 END) AS active_orders
                 FROM orders
                 WHERE user_id = ?
                 """,
@@ -442,17 +434,21 @@ class Database:
         with self.lock:
             users = self.conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()
             orders = self.conn.execute("SELECT COUNT(*) AS total FROM orders").fetchone()
-            revenue = self.conn.execute(
-                "SELECT SUM(price) AS total FROM orders WHERE status = 'completed' AND price > 0"
+            successful_otps = self.conn.execute(
+                "SELECT COUNT(*) AS total FROM orders WHERE otp_message IS NOT NULL"
             ).fetchone()
             active = self.conn.execute(
-                "SELECT COUNT(*) AS total FROM orders WHERE status IN ('waiting_otp', 'otp_locked')"
+                "SELECT COUNT(*) AS total FROM orders WHERE status = 'waiting_otp'"
+            ).fetchone()
+            pending_withdrawals = self.conn.execute(
+                "SELECT COUNT(*) AS total FROM withdrawals WHERE status = 'pending'"
             ).fetchone()
         return {
             "total_users": int(users["total"] or 0),
             "total_orders": int(orders["total"] or 0),
-            "revenue": float(revenue["total"] or 0),
+            "revenue": float((successful_otps["total"] or 0) * OTP_REWARD_BDT),
             "active_orders": int(active["total"] or 0),
+            "pending_withdrawals": int(pending_withdrawals["total"] or 0),
         }
 
     def _top_users_by_otps_sync(self, limit: int) -> list[dict[str, Any]]:
@@ -473,3 +469,126 @@ class Database:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    async def get_pending_withdrawal_for_user(self, user_id: int) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._fetchone,
+            """
+            SELECT * FROM withdrawals
+            WHERE user_id = ? AND status = 'pending'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (user_id,),
+        )
+
+    async def create_withdrawal(self, user_id: int, amount: float, address: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._create_withdrawal_sync, user_id, amount, address)
+
+    def _create_withdrawal_sync(self, user_id: int, amount: float, address: str) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.lock:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO withdrawals (user_id, amount, address, status, created_at, processed_at, admin_id)
+                VALUES (?, ?, ?, 'pending', ?, NULL, NULL)
+                """,
+                (user_id, amount, address, now),
+            )
+            withdrawal_id = cursor.lastrowid
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ?",
+                (withdrawal_id,),
+            ).fetchone()
+        return dict(row)
+
+    async def get_withdrawal(self, withdrawal_id: int) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._fetchone,
+            "SELECT * FROM withdrawals WHERE withdrawal_id = ?",
+            (withdrawal_id,),
+        )
+
+    async def list_pending_withdrawals(self, limit: int = 20) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._fetchall,
+            """
+            SELECT * FROM withdrawals
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    async def approve_withdrawal(
+        self, withdrawal_id: int, admin_id: int
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        return await asyncio.to_thread(self._approve_withdrawal_sync, withdrawal_id, admin_id)
+
+    def _approve_withdrawal_sync(
+        self, withdrawal_id: int, admin_id: int
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        now = utc_now_iso()
+        with self.lock:
+            withdrawal = self.conn.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ? AND status = 'pending'",
+                (withdrawal_id,),
+            ).fetchone()
+            if not withdrawal:
+                return False, "Withdrawal request is no longer pending.", None
+            user = self.conn.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (withdrawal["user_id"],),
+            ).fetchone()
+            if not user or float(user["balance"]) < float(withdrawal["amount"]):
+                return False, "User balance is not enough for this withdrawal.", None
+            self.conn.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                (withdrawal["amount"], withdrawal["user_id"]),
+            )
+            self.conn.execute(
+                """
+                UPDATE withdrawals
+                SET status = 'approved', processed_at = ?, admin_id = ?
+                WHERE withdrawal_id = ?
+                """,
+                (now, admin_id, withdrawal_id),
+            )
+            self.conn.commit()
+            updated = self.conn.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ?",
+                (withdrawal_id,),
+            ).fetchone()
+        return True, "Withdrawal approved.", dict(updated)
+
+    async def reject_withdrawal(
+        self, withdrawal_id: int, admin_id: int
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        return await asyncio.to_thread(self._reject_withdrawal_sync, withdrawal_id, admin_id)
+
+    def _reject_withdrawal_sync(
+        self, withdrawal_id: int, admin_id: int
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        now = utc_now_iso()
+        with self.lock:
+            withdrawal = self.conn.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ? AND status = 'pending'",
+                (withdrawal_id,),
+            ).fetchone()
+            if not withdrawal:
+                return False, "Withdrawal request is no longer pending.", None
+            self.conn.execute(
+                """
+                UPDATE withdrawals
+                SET status = 'rejected', processed_at = ?, admin_id = ?
+                WHERE withdrawal_id = ?
+                """,
+                (now, admin_id, withdrawal_id),
+            )
+            self.conn.commit()
+            updated = self.conn.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ?",
+                (withdrawal_id,),
+            ).fetchone()
+        return True, "Withdrawal rejected.", dict(updated)

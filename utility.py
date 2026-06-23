@@ -10,7 +10,15 @@ import aiohttp
 from aiogram.types import CopyTextButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import API_BASE_URL, API_KEY, HTTP_TIMEOUT_SECONDS, LIVEACCESS_CACHE_SECONDS
+from config import (
+    API_BASE_URL,
+    API_KEY,
+    HTTP_TIMEOUT_SECONDS,
+    LIVEACCESS_CACHE_SECONDS,
+    MIN_WITHDRAW_BDT,
+    OTP_REWARD_BDT,
+    WITHDRAW_NETWORK_LABEL,
+)
 
 
 class ProviderAPIError(Exception):
@@ -125,7 +133,7 @@ def service_emoji(service_name: str) -> str:
 
 
 def format_currency(amount: float) -> str:
-    return f"${amount:.2f}"
+    return f"৳{amount:.2f}"
 
 
 def format_number(number: str) -> str:
@@ -417,22 +425,34 @@ async def fetch_otps(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
 
 
 def format_dashboard(user: dict[str, Any], stats: dict[str, Any], settings: dict[str, Any]) -> str:
-    mode = "FREE MODE" if settings["free_mode"] else "PAID MODE"
     return (
         "🏠 <b>Home</b>\n\n"
+        "🎉 <b>Welcome!</b>\n"
+        "We don't enforce users to pay money. Instead, <b>we pay YOU</b>!\n"
+        f"For every OTP you successfully receive from the bot, you will get a <b>{format_currency(OTP_REWARD_BDT)}</b> credit to your balance.\n\n"
         f"🆔 User ID: <code>{user['user_id']}</code>\n"
         f"💰 Balance: <b>{format_currency(float(user['balance']))}</b>\n"
         f"📦 Active Orders: <b>{stats['active_orders']}</b>\n"
         f"📈 Total Orders: <b>{stats['total_orders']}</b>\n"
-        f"⚙ Mode: <b>{mode}</b>"
+        f"💸 Minimum Withdraw: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>"
     )
 
 
-def format_wallet(balance: float) -> str:
+def format_wallet(balance: float, wallet_address: str | None, pending_withdrawal: dict[str, Any] | None) -> str:
+    address_text = f"<code>{escape(wallet_address)}</code>" if wallet_address else "<b>Not set</b>"
+    pending_text = (
+        f"\n🕒 Pending Withdrawal: <b>{format_currency(float(pending_withdrawal['amount']))}</b>"
+        if pending_withdrawal
+        else ""
+    )
     return (
         "💰 <b>Wallet</b>\n\n"
         f"Available Balance: <b>{format_currency(balance)}</b>\n\n"
-        "Admin can top up manually with <code>/addbalance USER_ID AMOUNT</code>."
+        f"Reward Per OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
+        f"Minimum Withdraw: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>\n"
+        f"{WITHDRAW_NETWORK_LABEL} Address: {address_text}"
+        f"{pending_text}\n\n"
+        "Use the buttons below to withdraw or update your address."
     )
 
 
@@ -441,8 +461,8 @@ def format_help() -> str:
         "ℹ️ <b>Help</b>\n\n"
         "1. Choose <b>Get Number</b>.\n"
         "2. Pick a platform, then choose a live region.\n"
-        "3. Wait for the OTP worker to detect your code.\n"
-        "4. In paid mode, unlock the OTP from your wallet balance.\n\n"
+        f"3. When OTP arrives, you earn <b>{format_currency(OTP_REWARD_BDT)}</b> automatically.\n"
+        f"4. Once you reach <b>{format_currency(MIN_WITHDRAW_BDT)}</b>, submit a {WITHDRAW_NETWORK_LABEL} address and request withdrawal.\n\n"
         "The bot matches OTPs only by the exact allocated number."
     )
 
@@ -475,8 +495,9 @@ def format_admin_stats(stats: dict[str, Any]) -> str:
         "📊 <b>Admin Statistics</b>\n\n"
         f"👥 Total Users: <b>{stats['total_users']}</b>\n"
         f"📦 Total Orders: <b>{stats['total_orders']}</b>\n"
-        f"💵 Revenue: <b>{format_currency(stats['revenue'])}</b>\n"
-        f"⏳ Active Orders: <b>{stats['active_orders']}</b>"
+        f"🎁 Total Rewarded: <b>{format_currency(stats['revenue'])}</b>\n"
+        f"⏳ Active Orders: <b>{stats['active_orders']}</b>\n"
+        f"💸 Pending Withdrawals: <b>{stats.get('pending_withdrawals', 0)}</b>"
     )
 
 
@@ -495,13 +516,12 @@ def format_order_card(order: dict[str, Any], reveal_otp: bool = False) -> str:
     ]
     if order.get("completed_at"):
         lines.append(f"✅ Updated: <b>{format_iso(order['completed_at'])}</b>")
-    if order["status"] == "otp_locked":
-        lines.append(f"💳 Unlock Price: <b>{format_currency(float(order['price']))}</b>")
     if order.get("otp_message"):
         if reveal_otp:
             lines.append(f"📩 OTP Message: <code>{safe_message}</code>")
             if order.get("otp_code"):
                 lines.append(f"🔐 OTP Code: <b>{order['otp_code']}</b>")
+            lines.append(f"🎁 Reward Credited: <b>{format_currency(OTP_REWARD_BDT)}</b>")
         else:
             lines.append("🔒 OTP Message: <b>Locked</b>")
     else:
@@ -720,19 +740,7 @@ def build_orders_keyboard(orders: list[dict[str, Any]], kind: str) -> InlineKeyb
 
 def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    if order["status"] == "otp_locked":
-        builder.button(
-            text="💳 Unlock OTP",
-            callback_data=f"order:unlock:{order['order_id']}",
-            style="primary",
-        )
-        builder.button(
-            text="❌ Cancel",
-            callback_data=f"order:cancel:{order['order_id']}",
-            style="danger",
-        )
-        builder.button(text="⬅️ Back", callback_data="nav:orders", style="success")
-    elif order["status"] == "waiting_otp":
+    if order["status"] == "waiting_otp":
         builder.button(
             text="🔄 Refresh",
             callback_data=f"order:view:{order['order_id']}",
@@ -764,23 +772,73 @@ def build_leaderboard_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def build_wallet_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💸 Withdraw", callback_data="wallet:withdraw", style="primary")
+    builder.button(text="🪪 Change Address", callback_data="wallet:change_address", style="success")
+    builder.button(text="🏆 Leaderboard", callback_data="nav:leaderboard", style="primary")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def format_withdrawal_admin(withdrawal: dict[str, Any], user: dict[str, Any] | None) -> str:
+    username = f"@{user['username']}" if user and user.get("username") else "No username"
+    return (
+        "💸 <b>Withdrawal Request</b>\n\n"
+        f"🆔 User ID: <code>{withdrawal['user_id']}</code>\n"
+        f"👤 User: <b>{escape(username)}</b>\n"
+        f"💰 Amount: <b>{format_currency(float(withdrawal['amount']))}</b>\n"
+        f"🏦 {WITHDRAW_NETWORK_LABEL} Address:\n<code>{escape(withdrawal['address'])}</code>\n"
+        f"🕒 Requested: <b>{format_iso(withdrawal['created_at'])}</b>"
+    )
+
+
+def format_withdrawal_user(withdrawal: dict[str, Any], approved: bool) -> str:
+    if approved:
+        return (
+            "✅ <b>Withdrawal Approved</b>\n\n"
+            f"Amount: <b>{format_currency(float(withdrawal['amount']))}</b>\n"
+            f"Destination: <code>{escape(withdrawal['address'])}</code>\n\n"
+            f"Your balance has been deducted and the admin will pay your {WITHDRAW_NETWORK_LABEL} manually."
+        )
+    return (
+        "❌ <b>Withdrawal Rejected</b>\n\n"
+        f"Amount: <b>{format_currency(float(withdrawal['amount']))}</b>\n"
+        "No balance was deducted. You can submit a new withdrawal request later."
+    )
+
+
+def build_withdrawal_review_keyboard(withdrawal_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Approve",
+        callback_data=f"withdraw:approve:{withdrawal_id}",
+        style="success",
+    )
+    builder.button(
+        text="❌ Reject",
+        callback_data=f"withdraw:reject:{withdrawal_id}",
+        style="danger",
+    )
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def build_admin_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="⚙ Settings", callback_data="admin:settings", style="primary")
+    builder.button(text="⏱ Timeout", callback_data="admin:settings", style="primary")
     builder.button(text="💰 User Balances", callback_data="admin:balances", style="success")
+    builder.button(text="💸 Withdrawals", callback_data="admin:withdrawals", style="success")
     builder.button(text="📦 Active Orders", callback_data="admin:orders", style="primary")
     builder.button(text="📊 Statistics", callback_data="admin:stats", style="success")
     builder.button(text="🚫 Ban User", callback_data="admin:ban", style="danger")
     builder.button(text="✅ Unban User", callback_data="admin:unban", style="success")
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
 
 
 def build_admin_settings(settings: dict[str, Any]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    mode = "ON" if settings["free_mode"] else "OFF"
-    builder.button(text=f"Toggle Free Mode ({mode})", callback_data="admin:toggle_free", style="primary")
-    builder.button(text="Set OTP Price", callback_data="admin:set_price", style="success")
     builder.button(text="Set Timeout", callback_data="admin:set_timeout", style="primary")
     builder.button(text="⬅️ Admin Menu", callback_data="admin:menu", style="success")
     builder.adjust(1)

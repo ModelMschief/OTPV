@@ -17,9 +17,11 @@ from aiogram.types import CallbackQuery, Message
 from config import (
     ADMIN_IDS,
     BOT_TOKEN,
-    DEFAULT_OTP_PRICE,
     MAX_ACTIVE_ORDERS_PER_USER,
+    MIN_WITHDRAW_BDT,
     OTP_CHECK_INTERVAL,
+    OTP_REWARD_BDT,
+    WITHDRAW_NETWORK_LABEL,
 )
 from db import Database
 from utility import (
@@ -31,6 +33,8 @@ from utility import (
     build_custom_ranges_keyboard,
     build_home_keyboard,
     build_leaderboard_keyboard,
+    build_wallet_keyboard,
+    build_withdrawal_review_keyboard,
     build_order_actions,
     build_orders_keyboard,
     build_platforms_keyboard,
@@ -45,6 +49,8 @@ from utility import (
     format_iso,
     format_leaderboard,
     format_order_card,
+    format_withdrawal_admin,
+    format_withdrawal_user,
     format_user_stats,
     format_wallet,
     format_unix_ms,
@@ -74,7 +80,6 @@ otp_worker_task: asyncio.Task | None = None
 
 class AdminState(StatesGroup):
     waiting_balance = State()
-    waiting_price = State()
     waiting_timeout = State()
     waiting_ban = State()
     waiting_unban = State()
@@ -82,6 +87,11 @@ class AdminState(StatesGroup):
 
 class BuyState(StatesGroup):
     waiting_custom_range = State()
+
+
+class WalletState(StatesGroup):
+    waiting_address = State()
+    waiting_withdraw_amount = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -144,15 +154,25 @@ async def show_home(target: Message | CallbackQuery) -> None:
         await target.answer(text, reply_markup=markup)
 
 
-async def show_wallet(target: CallbackQuery) -> None:
-    if not await ensure_callback_user(target):
+async def send_wallet_view(target: Message | CallbackQuery) -> None:
+    user = target.from_user
+    allowed = await ensure_user_record(user)
+    if not allowed:
+        text = "🚫 Your access to this bot has been blocked."
+        if isinstance(target, CallbackQuery):
+            await target.answer(text, show_alert=True)
+        else:
+            await target.answer(text)
         return
-    await target.answer()
-    balance = await db.get_balance(target.from_user.id)
-    await target.message.answer(
-        format_wallet(balance),
-        reply_markup=build_home_keyboard(is_admin(target.from_user.id)),
-    )
+    balance = await db.get_balance(user.id)
+    wallet_address = await db.get_wallet_address(user.id)
+    pending_withdrawal = await db.get_pending_withdrawal_for_user(user.id)
+    text = format_wallet(balance, wallet_address, pending_withdrawal)
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        await target.message.answer(text, reply_markup=build_wallet_keyboard())
+    else:
+        await target.answer(text, reply_markup=build_wallet_keyboard())
 
 
 async def show_help(target: CallbackQuery) -> None:
@@ -346,7 +366,6 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
         return
 
     session = await get_session()
-    settings = await db.get_settings()
     try:
         service, region, rid = await pick_rid_for_region_service(session, service_token_value, region_code)
         allocated = await allocate_number(session, rid)
@@ -359,13 +378,12 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
         await target.answer("Provider returned an invalid number.", show_alert=True)
         return
 
-    price = 0.0 if settings["free_mode"] else float(settings["otp_price"] or DEFAULT_OTP_PRICE)
     order = await db.create_order(
         user_id=user_id,
         number=number,
         service=service["name"],
         region=region["name"],
-        price=price,
+        price=0.0,
     )
     text = (
         "📞 <b>Number Allocated</b>\n\n"
@@ -373,11 +391,8 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
         f"🔹 Service: <b>{html.escape(service['name'])}</b>\n"
         f"📞 Number: <code>+{number}</code>\n"
         f"📌 Status: <b>Waiting for OTP</b>\n"
+        f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    if price > 0:
-        text += f"💳 Unlock Price: <b>{format_currency(price)}</b>\n"
-    else:
-        text += "🎁 Free Mode: <b>OTP will be delivered automatically</b>\n"
     await safe_edit(target, text, build_order_actions(order))
 
 
@@ -393,7 +408,6 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
         return
 
     session = await get_session()
-    settings = await db.get_settings()
     try:
         range_entry, service = await pick_service_for_range(session, rid, token)
         allocated = await allocate_number(session, rid)
@@ -406,13 +420,12 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
         await target.answer("Provider returned an invalid number.", show_alert=True)
         return
 
-    price = 0.0 if settings["free_mode"] else float(settings["otp_price"] or DEFAULT_OTP_PRICE)
     order = await db.create_order(
         user_id=user_id,
         number=number,
         service=service["name"],
         region=range_entry["region_name"],
-        price=price,
+        price=0.0,
     )
     text = (
         "📞 <b>Number Allocated</b>\n\n"
@@ -421,11 +434,8 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
         f"🔹 Service: <b>{html.escape(service['name'])}</b>\n"
         f"📞 Number: <code>+{number}</code>\n"
         f"📌 Status: <b>Waiting for OTP</b>\n"
+        f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    if price > 0:
-        text += f"💳 Unlock Price: <b>{format_currency(price)}</b>\n"
-    else:
-        text += "🎁 Free Mode: <b>OTP will be delivered automatically</b>\n"
     await target.answer()
     await safe_edit(target, text, build_order_actions(order))
 
@@ -485,15 +495,7 @@ async def custom_range_text_handler(message: Message, state: FSMContext) -> None
 
 @router.message(F.text == "💰 Wallet")
 async def wallet_text_handler(message: Message) -> None:
-    allowed = await ensure_user_record(message.from_user)
-    if not allowed:
-        await message.answer("🚫 Your access to this bot has been blocked.")
-        return
-    balance = await db.get_balance(message.from_user.id)
-    await message.answer(
-        format_wallet(balance),
-        reply_markup=build_home_keyboard(is_admin(message.from_user.id)),
-    )
+    await send_wallet_view(message)
 
 
 @router.message(F.text == "📦 My Orders")
@@ -540,9 +542,10 @@ async def admin_handler(message: Message) -> None:
     settings = await db.get_settings()
     text = (
         "🛠 <b>Admin Panel</b>\n\n"
-        f"Free Mode: <b>{'ON' if settings['free_mode'] else 'OFF'}</b>\n"
-        f"OTP Price: <b>{format_currency(settings['otp_price'])}</b>\n"
-        f"Timeout: <b>{settings['order_timeout_minutes']} minutes</b>"
+        f"OTP Reward: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
+        f"Minimum Withdraw: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>\n"
+        f"Timeout: <b>{settings['order_timeout_minutes']} minutes</b>\n"
+        f"Network: <b>{WITHDRAW_NETWORK_LABEL}</b>"
     )
     await message.answer(text, reply_markup=build_admin_menu())
 
@@ -581,7 +584,53 @@ async def home_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "nav:wallet")
 async def wallet_callback(callback: CallbackQuery) -> None:
-    await show_wallet(callback)
+    await send_wallet_view(callback)
+
+
+@router.callback_query(F.data == "wallet:change_address")
+async def wallet_change_address_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    await callback.answer()
+    await state.set_state(WalletState.waiting_address)
+    await state.update_data(next_action="wallet")
+    await callback.message.answer(
+        f"Send your {WITHDRAW_NETWORK_LABEL} address now.",
+        reply_markup=build_wallet_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "wallet:withdraw")
+async def wallet_withdraw_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    balance = await db.get_balance(callback.from_user.id)
+    address = await db.get_wallet_address(callback.from_user.id)
+    pending = await db.get_pending_withdrawal_for_user(callback.from_user.id)
+    if pending:
+        await callback.answer("You already have a pending withdrawal request.", show_alert=True)
+        return
+    if not address:
+        await callback.answer()
+        await state.set_state(WalletState.waiting_address)
+        await state.update_data(next_action="withdraw")
+        await callback.message.answer(
+            f"Before withdrawing, send your {WITHDRAW_NETWORK_LABEL} address.",
+            reply_markup=build_wallet_keyboard(),
+        )
+        return
+    if balance < MIN_WITHDRAW_BDT:
+        await callback.answer(
+            f"You need at least {format_currency(MIN_WITHDRAW_BDT)} to withdraw.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    await state.set_state(WalletState.waiting_withdraw_amount)
+    await callback.message.answer(
+        f"Send the amount you want to withdraw in BDT.\nMinimum: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>",
+        reply_markup=build_wallet_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "nav:help")
@@ -666,13 +715,7 @@ async def order_view_callback(callback: CallbackQuery) -> None:
 async def order_unlock_callback(callback: CallbackQuery) -> None:
     if not await ensure_callback_user(callback):
         return
-    order_id = int(callback.data.split(":")[-1])
-    success, message, order = await db.unlock_order(order_id, callback.from_user.id)
-    if not success or not order:
-        await callback.answer(message, show_alert=True)
-        return
-    await callback.answer()
-    await safe_edit(callback, format_order_card(order, reveal_otp=True), build_order_actions(order))
+    await callback.answer("OTP unlock is no longer used. Rewards are credited automatically.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("order:cancel:"))
@@ -692,6 +735,52 @@ async def order_cancel_callback(callback: CallbackQuery) -> None:
     await safe_edit(callback, format_order_card(updated, reveal_otp=False), build_order_actions(updated))
 
 
+@router.callback_query(F.data.startswith("withdraw:approve:"))
+async def withdraw_approve_callback(callback: CallbackQuery) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Admins only.", show_alert=True)
+        return
+    withdrawal_id = int(callback.data.split(":")[-1])
+    success, message, withdrawal = await db.approve_withdrawal(withdrawal_id, callback.from_user.id)
+    if not success or not withdrawal:
+        await callback.answer(message, show_alert=True)
+        return
+    await callback.answer("Withdrawal approved.")
+    with suppress(Exception):
+        await callback.message.edit_reply_markup(reply_markup=None)
+    with suppress(Exception):
+        await callback.bot.send_message(
+            withdrawal["user_id"],
+            format_withdrawal_user(withdrawal, approved=True),
+            reply_markup=build_wallet_keyboard(),
+        )
+
+
+@router.callback_query(F.data.startswith("withdraw:reject:"))
+async def withdraw_reject_callback(callback: CallbackQuery) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Admins only.", show_alert=True)
+        return
+    withdrawal_id = int(callback.data.split(":")[-1])
+    success, message, withdrawal = await db.reject_withdrawal(withdrawal_id, callback.from_user.id)
+    if not success or not withdrawal:
+        await callback.answer(message, show_alert=True)
+        return
+    await callback.answer("Withdrawal rejected.")
+    with suppress(Exception):
+        await callback.message.edit_reply_markup(reply_markup=None)
+    with suppress(Exception):
+        await callback.bot.send_message(
+            withdrawal["user_id"],
+            format_withdrawal_user(withdrawal, approved=False),
+            reply_markup=build_wallet_keyboard(),
+        )
+
+
 @router.callback_query(F.data == "admin:menu")
 async def admin_menu_callback(callback: CallbackQuery) -> None:
     if not await ensure_callback_user(callback):
@@ -703,9 +792,10 @@ async def admin_menu_callback(callback: CallbackQuery) -> None:
     settings = await db.get_settings()
     text = (
         "🛠 <b>Admin Panel</b>\n\n"
-        f"Free Mode: <b>{'ON' if settings['free_mode'] else 'OFF'}</b>\n"
-        f"OTP Price: <b>{format_currency(settings['otp_price'])}</b>\n"
-        f"Timeout: <b>{settings['order_timeout_minutes']} minutes</b>"
+        f"OTP Reward: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
+        f"Minimum Withdraw: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>\n"
+        f"Timeout: <b>{settings['order_timeout_minutes']} minutes</b>\n"
+        f"Network: <b>{WITHDRAW_NETWORK_LABEL}</b>"
     )
     await safe_edit(callback, text, build_admin_menu())
 
@@ -720,36 +810,12 @@ async def admin_settings_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     settings = await db.get_settings()
     text = (
-        "⚙ <b>Settings</b>\n\n"
-        f"Free Mode: <b>{'ON' if settings['free_mode'] else 'OFF'}</b>\n"
-        f"OTP Price: <b>{format_currency(settings['otp_price'])}</b>\n"
+        "⏱ <b>Order Timeout</b>\n\n"
+        f"OTP Reward: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
+        f"Minimum Withdraw: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>\n"
         f"Timeout: <b>{settings['order_timeout_minutes']} minutes</b>"
     )
     await safe_edit(callback, text, build_admin_settings(settings))
-
-
-@router.callback_query(F.data == "admin:toggle_free")
-async def admin_toggle_free_callback(callback: CallbackQuery) -> None:
-    if not await ensure_callback_user(callback):
-        return
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Admins only.", show_alert=True)
-        return
-    settings = await db.get_settings()
-    await db.set_free_mode(not settings["free_mode"])
-    await admin_settings_callback(callback)
-
-
-@router.callback_query(F.data == "admin:set_price")
-async def admin_set_price_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await ensure_callback_user(callback):
-        return
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Admins only.", show_alert=True)
-        return
-    await callback.answer()
-    await state.set_state(AdminState.waiting_price)
-    await callback.message.answer("Send the new OTP price in USD, for example: <code>0.25</code>")
 
 
 @router.callback_query(F.data == "admin:set_timeout")
@@ -786,6 +852,27 @@ async def admin_stats_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     stats = await db.admin_stats()
     await safe_edit(callback, format_admin_stats(stats), build_admin_menu())
+
+
+@router.callback_query(F.data == "admin:withdrawals")
+async def admin_withdrawals_callback(callback: CallbackQuery) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Admins only.", show_alert=True)
+        return
+    await callback.answer()
+    withdrawals = await db.list_pending_withdrawals()
+    if not withdrawals:
+        text = "💸 <b>Pending Withdrawals</b>\n\nNo pending withdrawals right now."
+    else:
+        lines = ["💸 <b>Pending Withdrawals</b>\n"]
+        for withdrawal in withdrawals:
+            lines.append(
+                f"#{withdrawal['withdrawal_id']} • {withdrawal['user_id']} • {format_currency(float(withdrawal['amount']))}"
+            )
+        text = "\n".join(lines)
+    await safe_edit(callback, text, build_admin_menu())
 
 
 @router.callback_query(F.data == "admin:orders")
@@ -860,21 +947,97 @@ async def admin_balance_input(message: Message, state: FSMContext) -> None:
     await message.answer(f"Updated balance: <b>{format_currency(balance)}</b> for <code>{user_id}</code>.")
 
 
-@router.message(AdminState.waiting_price)
-async def admin_price_input(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+@router.message(WalletState.waiting_address)
+async def wallet_address_input(message: Message, state: FSMContext) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    address = (message.text or "").strip()
+    if len(address) < 10 or " " in address:
+        await message.answer(
+            f"Send a valid {WITHDRAW_NETWORK_LABEL} address without spaces.",
+            reply_markup=build_wallet_keyboard(),
+        )
+        return
+    await db.set_wallet_address(message.from_user.id, address)
+    data = await state.get_data()
+    await state.clear()
+    await message.answer(
+        f"{WITHDRAW_NETWORK_LABEL} address saved successfully.",
+        reply_markup=build_wallet_keyboard(),
+    )
+    if data.get("next_action") == "withdraw":
+        balance = await db.get_balance(message.from_user.id)
+        if balance < MIN_WITHDRAW_BDT:
+            await message.answer(
+                f"You need at least {format_currency(MIN_WITHDRAW_BDT)} to withdraw.",
+                reply_markup=build_wallet_keyboard(),
+            )
+            return
+        await state.set_state(WalletState.waiting_withdraw_amount)
+        await message.answer(
+            f"Now send the amount you want to withdraw in BDT.\nMinimum: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>",
+            reply_markup=build_wallet_keyboard(),
+        )
+
+
+@router.message(WalletState.waiting_withdraw_amount)
+async def wallet_withdraw_amount_input(message: Message, state: FSMContext) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    pending = await db.get_pending_withdrawal_for_user(message.from_user.id)
+    if pending:
+        await state.clear()
+        await message.answer("You already have a pending withdrawal request.", reply_markup=build_wallet_keyboard())
         return
     try:
-        price = float((message.text or "").strip())
+        amount = float((message.text or "").strip())
     except ValueError:
-        await message.answer("Send a valid number, for example: <code>0.25</code>")
+        await message.answer(
+            "Send a valid BDT amount, for example <code>50</code>.",
+            reply_markup=build_wallet_keyboard(),
+        )
         return
-    if price < 0:
-        await message.answer("Price must be zero or greater.")
+    balance = await db.get_balance(message.from_user.id)
+    address = await db.get_wallet_address(message.from_user.id)
+    if not address:
+        await state.set_state(WalletState.waiting_address)
+        await state.update_data(next_action="withdraw")
+        await message.answer(
+            f"Please send your {WITHDRAW_NETWORK_LABEL} address first.",
+            reply_markup=build_wallet_keyboard(),
+        )
         return
-    await db.set_otp_price(price)
+    if amount < MIN_WITHDRAW_BDT:
+        await message.answer(
+            f"The minimum withdrawal is {format_currency(MIN_WITHDRAW_BDT)}.",
+            reply_markup=build_wallet_keyboard(),
+        )
+        return
+    if amount > balance:
+        await message.answer(
+            f"You only have {format_currency(balance)} available.",
+            reply_markup=build_wallet_keyboard(),
+        )
+        return
+    withdrawal = await db.create_withdrawal(message.from_user.id, amount, address)
+    user = await db.get_user(message.from_user.id)
+    admin_text = format_withdrawal_admin(withdrawal, user)
+    for admin_id in ADMIN_IDS:
+        with suppress(Exception):
+            await message.bot.send_message(
+                admin_id,
+                admin_text,
+                reply_markup=build_withdrawal_review_keyboard(withdrawal["withdrawal_id"]),
+            )
     await state.clear()
-    await message.answer(f"OTP price updated to <b>{format_currency(price)}</b>.")
+    await message.answer(
+        f"Withdrawal request submitted for <b>{format_currency(amount)}</b>.\nAdmin will review and pay it manually to your {WITHDRAW_NETWORK_LABEL} address.",
+        reply_markup=build_wallet_keyboard(),
+    )
 
 
 @router.message(AdminState.waiting_timeout)
@@ -980,15 +1143,11 @@ async def otp_worker(bot: Bot) -> None:
                     continue
 
                 logger.info("Matched OTP for order %s and number %s", order["order_id"], number)
-                if order["status"] == "otp_locked":
-                    text = (
-                        "🔒 <b>OTP Received</b>\n\n"
-                        f"Order #{order['order_id']} now has an OTP waiting.\n"
-                        f"Unlock Price: <b>{format_currency(float(order['price']))}</b>\n"
-                        f"Received: <b>{format_unix_ms(int(otp.get('time', 0)))}</b>"
-                    )
-                else:
-                    text = format_order_card(order, reveal_otp=True)
+                text = (
+                    f"{format_order_card(order, reveal_otp=True)}\n\n"
+                    f"🎁 Reward Added: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
+                    f"🕒 Received: <b>{format_unix_ms(int(otp.get('time', 0)))}</b>"
+                )
                 with suppress(Exception):
                     await bot.send_message(
                         order["user_id"],
