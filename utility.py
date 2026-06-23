@@ -458,22 +458,25 @@ def format_wallet(balance: float, wallet_address: str | None, pending_withdrawal
 
 def format_help() -> str:
     return (
-        "ℹ️ <b>Help</b>\n\n"
-        "1. Choose <b>Get Number</b>.\n"
-        "2. Pick a platform, then choose a live region.\n"
-        f"3. When OTP arrives, you earn <b>{format_currency(OTP_REWARD_BDT)}</b> automatically.\n"
-        f"4. Once you reach <b>{format_currency(MIN_WITHDRAW_BDT)}</b>, submit a {WITHDRAW_NETWORK_LABEL} address and request withdrawal.\n\n"
-        "The bot matches OTPs only by the exact allocated number."
+        "ℹ️ <b>How to Use This Bot</b>\n\n"
+        "🔹 <b>Step 1:</b> Tap on <b>Get Number</b> from the menu.\n\n"
+        "🔹 <b>Step 2:</b> Select your desired platform and choose a live region.\n\n"
+        f"🔹 <b>Step 3:</b> When the OTP arrives, you will automatically earn a <b>{format_currency(OTP_REWARD_BDT)}</b> reward!\n\n"
+        f"🔹 <b>Step 4:</b> Once your balance reaches <b>{format_currency(MIN_WITHDRAW_BDT)}</b>, submit your <b>{WITHDRAW_NETWORK_LABEL}</b> address to request a withdrawal.\n\n"
+        "⚠️ <i>Note: The bot matches OTPs only by the exact allocated number.</i>"
     )
 
 
-def format_user_stats(stats: dict[str, Any], balance: float) -> str:
+def format_profile(user: dict[str, Any], stats: dict[str, Any], balance: float) -> str:
+    username = f"@{user['username']}" if user.get("username") else "No username"
     return (
-        "📊 <b>Your Statistics</b>\n\n"
+        "👤 <b>My Profile</b>\n\n"
+        f"🆔 ID: <code>{user['user_id']}</code>\n"
+        f"👤 Name: <b>{escape(username)}</b>\n"
+        f"💰 Balance: <b>{format_currency(balance)}</b>\n\n"
         f"📦 Total Orders: <b>{stats['total_orders']}</b>\n"
         f"✅ Successful OTPs: <b>{stats['successful_otps']}</b>\n"
-        f"⏳ Active Orders: <b>{stats['active_orders']}</b>\n"
-        f"💰 Balance: <b>{format_currency(balance)}</b>"
+        f"⏳ Active Orders: <b>{stats['active_orders']}</b>"
     )
 
 
@@ -537,11 +540,11 @@ def build_home_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
         ],
         [
             KeyboardButton(text="💰 Wallet", style="success"),
-            KeyboardButton(text="📦 My Orders", style="primary"),
+            KeyboardButton(text="ℹ️ Help", style="primary"),
         ],
         [
             KeyboardButton(text="🏆 Leaderboard", style="primary"),
-            KeyboardButton(text="ℹ️ Help", style="success"),
+            KeyboardButton(text="👤 Profile", style="success"),
         ],
     ]
     if is_admin:
@@ -664,8 +667,9 @@ def build_services_keyboard(
 
 def build_custom_range_prompt_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Regions", callback_data="buy:start", style="success")
-    builder.adjust(1)
+    builder.button(text="👀 See Ranges", url="https://t.me/NEWTON_RENGE_GROUP",style="primary")
+    builder.button(text="❌ Cancel", callback_data="nav:cancel_action", style="danger")
+    builder.adjust(1, 1)
     return builder.as_markup()
 
 
@@ -841,5 +845,27 @@ def build_admin_settings(settings: dict[str, Any]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Set Timeout", callback_data="admin:set_timeout", style="primary")
     builder.button(text="⬅️ Admin Menu", callback_data="admin:menu", style="success")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def build_profile_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⏳ Active Orders", callback_data="nav:orders:active", style="primary")
+    builder.button(text="✅ Completed Orders", callback_data="nav:orders:completed", style="success")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def build_cancel_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Cancel", callback_data="nav:cancel_action", style="danger")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def build_help_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Contact Admin (@dear_newton)", url="https://t.me/dear_newton",style="primary")
     builder.adjust(1)
     return builder.as_markup()

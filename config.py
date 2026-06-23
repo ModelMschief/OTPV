@@ -1,7 +1,7 @@
 BOT_TOKEN = "8258014137:AAHJf4gXJEJ8sJsg-CClWVuifB-PqsdFv4A"
 
 # Replace with your Telegram numeric user IDs.
-ADMIN_IDS = {8374454975}
+ADMIN_IDS = {7533495029}
 
 API_KEY = "MASP6HHKCNF"
 API_BASE_URL = "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api"

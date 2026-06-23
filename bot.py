@@ -32,7 +32,10 @@ from utility import (
     build_custom_range_prompt_keyboard,
     build_custom_ranges_keyboard,
     build_home_keyboard,
+    build_help_keyboard,
     build_leaderboard_keyboard,
+    build_profile_keyboard,
+    build_cancel_keyboard,
     build_wallet_keyboard,
     build_withdrawal_review_keyboard,
     build_order_actions,
@@ -51,7 +54,7 @@ from utility import (
     format_order_card,
     format_withdrawal_admin,
     format_withdrawal_user,
-    format_user_stats,
+    format_profile,
     format_wallet,
     format_unix_ms,
     get_catalog,
@@ -64,6 +67,7 @@ from utility import (
     pick_rid_for_region_service,
     search_custom_ranges,
 )
+from range_notifier import start_range_notifier
 
 
 logging.basicConfig(
@@ -76,6 +80,7 @@ router = Router()
 db = Database()
 http_session: aiohttp.ClientSession | None = None
 otp_worker_task: asyncio.Task | None = None
+range_notifier_task: asyncio.Task | None = None
 
 
 class AdminState(StatesGroup):
@@ -179,26 +184,32 @@ async def show_help(target: CallbackQuery) -> None:
     if not await ensure_callback_user(target):
         return
     await target.answer()
-    await target.message.answer(
-        format_help(),
-        reply_markup=build_home_keyboard(is_admin(target.from_user.id)),
-    )
+    await safe_edit(target, format_help(), build_help_keyboard())
 
 
-async def show_user_stats(target: CallbackQuery) -> None:
-    if not await ensure_callback_user(target):
+async def show_profile(target: Message | CallbackQuery) -> None:
+    user = target.from_user
+    allowed = await ensure_user_record(user)
+    if not allowed:
+        text = "🚫 Your access to this bot has been blocked."
+        if isinstance(target, CallbackQuery):
+            await target.answer(text, show_alert=True)
+        else:
+            await target.answer(text)
         return
-    await target.answer()
-    stats = await db.user_stats(target.from_user.id)
-    balance = await db.get_balance(target.from_user.id)
-    text = format_user_stats(stats, balance)
-    if is_admin(target.from_user.id):
+    db_user = await db.get_user(user.id)
+    stats = await db.user_stats(user.id)
+    balance = await db.get_balance(user.id)
+    text = format_profile(db_user, stats, balance)
+    if is_admin(user.id):
         admin_stats = await db.admin_stats()
         text = f"{text}\n\n{format_admin_stats(admin_stats)}"
-    await target.message.answer(
-        text,
-        reply_markup=build_home_keyboard(is_admin(target.from_user.id)),
-    )
+    markup = build_profile_keyboard()
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        await safe_edit(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
 
 
 async def show_leaderboard(target: Message | CallbackQuery) -> None:
@@ -490,7 +501,8 @@ async def custom_range_text_handler(message: Message, state: FSMContext) -> None
         "<code>26134</code>\n\n"
         "I will search the live provider ranges and show the matches as inline buttons."
     )
-    await message.answer(text, reply_markup=build_custom_range_prompt_keyboard())
+    msg = await message.answer(text, reply_markup=build_custom_range_prompt_keyboard())
+    await state.update_data(prompt_msg_id=msg.message_id)
 
 
 @router.message(F.text == "💰 Wallet")
@@ -498,23 +510,9 @@ async def wallet_text_handler(message: Message) -> None:
     await send_wallet_view(message)
 
 
-@router.message(F.text == "📦 My Orders")
-async def orders_text_handler(message: Message) -> None:
-    allowed = await ensure_user_record(message.from_user)
-    if not allowed:
-        await message.answer("🚫 Your access to this bot has been blocked.")
-        return
-    orders = await db.list_user_orders(message.from_user.id, kind="active")
-    if not orders:
-        text = "📦 <b>Active Orders</b>\n\nNo active orders found yet."
-    else:
-        lines = ["📦 <b>Active Orders</b>\n"]
-        for order in orders:
-            lines.append(
-                f"#{order['order_id']} • {order['service']} • {human_status(order['status'])} • {format_iso(order['created_at'])}"
-            )
-        text = "\n".join(lines)
-    await message.answer(text, reply_markup=build_orders_keyboard(orders, "active"))
+@router.message(F.text == "👤 Profile")
+async def profile_text_handler(message: Message) -> None:
+    await show_profile(message)
 
 
 @router.message(F.text == "🏆 Leaderboard")
@@ -530,7 +528,7 @@ async def help_text_handler(message: Message) -> None:
         return
     await message.answer(
         format_help(),
-        reply_markup=build_home_keyboard(is_admin(message.from_user.id)),
+        reply_markup=build_help_keyboard(),
     )
 
 
@@ -594,9 +592,9 @@ async def wallet_change_address_callback(callback: CallbackQuery, state: FSMCont
     await callback.answer()
     await state.set_state(WalletState.waiting_address)
     await state.update_data(next_action="wallet")
-    await callback.message.answer(
+    await safe_edit(callback,
         f"Send your {WITHDRAW_NETWORK_LABEL} address now.",
-        reply_markup=build_wallet_keyboard(),
+        reply_markup=build_cancel_keyboard(),
     )
 
 
@@ -614,9 +612,9 @@ async def wallet_withdraw_callback(callback: CallbackQuery, state: FSMContext) -
         await callback.answer()
         await state.set_state(WalletState.waiting_address)
         await state.update_data(next_action="withdraw")
-        await callback.message.answer(
+        await safe_edit(callback,
             f"Before withdrawing, send your {WITHDRAW_NETWORK_LABEL} address.",
-            reply_markup=build_wallet_keyboard(),
+            reply_markup=build_cancel_keyboard(),
         )
         return
     if balance < MIN_WITHDRAW_BDT:
@@ -627,9 +625,9 @@ async def wallet_withdraw_callback(callback: CallbackQuery, state: FSMContext) -
         return
     await callback.answer()
     await state.set_state(WalletState.waiting_withdraw_amount)
-    await callback.message.answer(
+    await safe_edit(callback,
         f"Send the amount you want to withdraw in BDT.\nMinimum: <b>{format_currency(MIN_WITHDRAW_BDT)}</b>",
-        reply_markup=build_wallet_keyboard(),
+        reply_markup=build_cancel_keyboard(),
     )
 
 
@@ -827,7 +825,7 @@ async def admin_set_timeout_callback(callback: CallbackQuery, state: FSMContext)
         return
     await callback.answer()
     await state.set_state(AdminState.waiting_timeout)
-    await callback.message.answer("Send the new order timeout in minutes, for example: <code>10</code>")
+    await safe_edit(callback, "Send the new order timeout in minutes, for example: <code>10</code>", build_cancel_keyboard())
 
 
 @router.callback_query(F.data == "admin:balances")
@@ -839,7 +837,7 @@ async def admin_balances_callback(callback: CallbackQuery, state: FSMContext) ->
         return
     await callback.answer()
     await state.set_state(AdminState.waiting_balance)
-    await callback.message.answer("Send: <code>USER_ID AMOUNT</code>")
+    await safe_edit(callback, "Send: <code>USER_ID AMOUNT</code>", build_cancel_keyboard())
 
 
 @router.callback_query(F.data == "admin:stats")
@@ -905,7 +903,7 @@ async def admin_ban_callback(callback: CallbackQuery, state: FSMContext) -> None
         return
     await callback.answer()
     await state.set_state(AdminState.waiting_ban)
-    await callback.message.answer("Send the user ID to ban.")
+    await safe_edit(callback, "Send the user ID to ban.", build_cancel_keyboard())
 
 
 @router.callback_query(F.data == "admin:unban")
@@ -917,7 +915,16 @@ async def admin_unban_callback(callback: CallbackQuery, state: FSMContext) -> No
         return
     await callback.answer()
     await state.set_state(AdminState.waiting_unban)
-    await callback.message.answer("Send the user ID to unban.")
+    await safe_edit(callback, "Send the user ID to unban.", build_cancel_keyboard())
+
+@router.callback_query(F.data == "nav:cancel_action")
+async def cancel_action_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    await state.clear()
+    await callback.answer("Action cancelled.")
+    await safe_edit(callback, "❌ <b>Action cancelled.</b>", reply_markup=None)
+
 
 
 @router.callback_query(F.data == "noop")
@@ -1162,7 +1169,7 @@ async def otp_worker(bot: Bot) -> None:
 
 
 async def on_startup(bot: Bot) -> None:
-    global http_session, otp_worker_task
+    global http_session, otp_worker_task, range_notifier_task
     await db.initialize()
     http_session = aiohttp.ClientSession()
     try:
@@ -1171,14 +1178,19 @@ async def on_startup(bot: Bot) -> None:
     except Exception as error:
         logger.warning("Could not preload provider catalog: %s", error)
     otp_worker_task = asyncio.create_task(otp_worker(bot))
+    range_notifier_task = start_range_notifier(bot, http_session)
 
 
 async def on_shutdown(_bot: Bot) -> None:
-    global otp_worker_task, http_session
+    global otp_worker_task, range_notifier_task, http_session
     if otp_worker_task:
         otp_worker_task.cancel()
         with suppress(asyncio.CancelledError):
             await otp_worker_task
+    if range_notifier_task:
+        range_notifier_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await range_notifier_task
     if http_session:
         await http_session.close()
     await db.close()
