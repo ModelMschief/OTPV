@@ -435,6 +435,9 @@ class Database:
     async def admin_stats(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._admin_stats_sync)
 
+    async def top_users_by_otps(self, limit: int = 5) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._top_users_by_otps_sync, limit)
+
     def _admin_stats_sync(self) -> dict[str, Any]:
         with self.lock:
             users = self.conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()
@@ -451,3 +454,22 @@ class Database:
             "revenue": float(revenue["total"] or 0),
             "active_orders": int(active["total"] or 0),
         }
+
+    def _top_users_by_otps_sync(self, limit: int) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    u.user_id,
+                    u.username,
+                    COUNT(o.order_id) AS otp_count
+                FROM users u
+                JOIN orders o ON o.user_id = u.user_id
+                WHERE o.otp_message IS NOT NULL
+                GROUP BY u.user_id, u.username
+                ORDER BY otp_count DESC, u.user_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]

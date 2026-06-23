@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -26,11 +27,15 @@ from utility import (
     allocate_number,
     build_admin_menu,
     build_admin_settings,
+    build_custom_range_prompt_keyboard,
+    build_custom_ranges_keyboard,
     build_home_keyboard,
+    build_leaderboard_keyboard,
     build_order_actions,
     build_orders_keyboard,
-    build_regions_keyboard,
-    build_services_keyboard,
+    build_platforms_keyboard,
+    build_range_services_keyboard,
+    build_service_regions_keyboard,
     extract_otp,
     fetch_otps,
     format_admin_stats,
@@ -38,16 +43,20 @@ from utility import (
     format_dashboard,
     format_help,
     format_iso,
+    format_leaderboard,
     format_order_card,
     format_user_stats,
     format_wallet,
     format_unix_ms,
     get_catalog,
-    get_region_services,
-    get_regions,
+    get_range_services,
+    get_service_regions,
+    get_services,
     human_status,
     normalize_digits,
-    pick_rid_for_service,
+    pick_service_for_range,
+    pick_rid_for_region_service,
+    search_custom_ranges,
 )
 
 
@@ -69,6 +78,10 @@ class AdminState(StatesGroup):
     waiting_timeout = State()
     waiting_ban = State()
     waiting_unban = State()
+
+
+class BuyState(StatesGroup):
+    waiting_custom_range = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -100,7 +113,12 @@ async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None) -> No
     try:
         await callback.message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest:
-        await callback.message.answer(text, reply_markup=reply_markup)
+        logger.exception("Failed to edit message; falling back to safe plain text send.")
+        fallback_text = html.escape(text)
+        await callback.message.answer(
+            f"<pre>{fallback_text}</pre>",
+            reply_markup=reply_markup,
+        )
 
 
 async def show_home(target: Message | CallbackQuery) -> None:
@@ -121,7 +139,7 @@ async def show_home(target: Message | CallbackQuery) -> None:
     markup = build_home_keyboard(is_admin(user.id))
     if isinstance(target, CallbackQuery):
         await target.answer()
-        await safe_edit(target, text, markup)
+        await target.message.answer(text, reply_markup=markup)
     else:
         await target.answer(text, reply_markup=markup)
 
@@ -131,14 +149,20 @@ async def show_wallet(target: CallbackQuery) -> None:
         return
     await target.answer()
     balance = await db.get_balance(target.from_user.id)
-    await safe_edit(target, format_wallet(balance), build_home_keyboard(is_admin(target.from_user.id)))
+    await target.message.answer(
+        format_wallet(balance),
+        reply_markup=build_home_keyboard(is_admin(target.from_user.id)),
+    )
 
 
 async def show_help(target: CallbackQuery) -> None:
     if not await ensure_callback_user(target):
         return
     await target.answer()
-    await safe_edit(target, format_help(), build_home_keyboard(is_admin(target.from_user.id)))
+    await target.message.answer(
+        format_help(),
+        reply_markup=build_home_keyboard(is_admin(target.from_user.id)),
+    )
 
 
 async def show_user_stats(target: CallbackQuery) -> None:
@@ -151,7 +175,29 @@ async def show_user_stats(target: CallbackQuery) -> None:
     if is_admin(target.from_user.id):
         admin_stats = await db.admin_stats()
         text = f"{text}\n\n{format_admin_stats(admin_stats)}"
-    await safe_edit(target, text, build_home_keyboard(is_admin(target.from_user.id)))
+    await target.message.answer(
+        text,
+        reply_markup=build_home_keyboard(is_admin(target.from_user.id)),
+    )
+
+
+async def show_leaderboard(target: Message | CallbackQuery) -> None:
+    user = target.from_user
+    allowed = await ensure_user_record(user)
+    if not allowed:
+        text = "🚫 Your access to this bot has been blocked."
+        if isinstance(target, CallbackQuery):
+            await target.answer(text, show_alert=True)
+        else:
+            await target.answer(text)
+        return
+    entries = await db.top_users_by_otps(limit=5)
+    text = format_leaderboard(entries, current_user_id=user.id)
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        await target.message.answer(text, reply_markup=build_leaderboard_keyboard())
+    else:
+        await target.answer(text, reply_markup=build_leaderboard_keyboard())
 
 
 async def show_orders(target: CallbackQuery, kind: str = "active") -> None:
@@ -168,7 +214,7 @@ async def show_orders(target: CallbackQuery, kind: str = "active") -> None:
                 f"#{order['order_id']} • {order['service']} • {human_status(order['status'])} • {format_iso(order['created_at'])}"
             )
         text = "\n".join(lines)
-    await safe_edit(target, text, build_orders_keyboard(orders, kind))
+    await target.message.answer(text, reply_markup=build_orders_keyboard(orders, kind))
 
 
 async def show_single_order(target: CallbackQuery, order_id: int) -> None:
@@ -183,41 +229,112 @@ async def show_single_order(target: CallbackQuery, order_id: int) -> None:
     await safe_edit(target, format_order_card(order, reveal_otp=reveal_otp), build_order_actions(order))
 
 
-async def show_regions(target: CallbackQuery, page: int = 0, force_refresh: bool = False) -> None:
+async def show_platforms(target: CallbackQuery, page: int = 0, force_refresh: bool = False) -> None:
     if not await ensure_callback_user(target):
         return
     session = await get_session()
     try:
-        regions = await get_regions(session, force_refresh=force_refresh)
+        if force_refresh:
+            await get_catalog(session, force_refresh=True)
+        services = await get_services(session)
     except ProviderAPIError as error:
         await target.answer(str(error), show_alert=True)
         return
-    if not regions:
+    if not services:
         await target.answer()
-        await safe_edit(target, "No live regions are available right now.", build_home_keyboard(is_admin(target.from_user.id)))
-        return
-    await target.answer()
-    text = "🌍 <b>Select Region</b>\n\nLive regions are pulled from the provider access feed."
-    await safe_edit(target, text, build_regions_keyboard(regions, page=page))
-
-
-async def show_services(target: CallbackQuery, region_code: str, page: int = 0) -> None:
-    if not await ensure_callback_user(target):
-        return
-    session = await get_session()
-    region, services = await get_region_services(session, region_code)
-    if not region or not services:
-        await target.answer("This region is not available anymore. Please refresh.", show_alert=True)
+        await safe_edit(target, "No live platforms are available right now.", build_home_keyboard(is_admin(target.from_user.id)))
         return
     await target.answer()
     text = (
-        f"{region['flag']} <b>{region['name']}</b>\n\n"
-        "Select the service you want to use for this number."
+        "📱 <b>Select Platform</b>\n\n"
+        "Choose the platform first, then we will show the live regions available for that platform."
     )
-    await safe_edit(target, text, build_services_keyboard(region, services, page=page))
+    await safe_edit(target, text, build_platforms_keyboard(services, page=page))
 
 
-async def allocate_for_user(target: CallbackQuery, region_code: str, token: str) -> None:
+async def show_service_regions(target: CallbackQuery, service_token_value: str, page: int = 0) -> None:
+    if not await ensure_callback_user(target):
+        return
+    session = await get_session()
+    service, regions = await get_service_regions(session, service_token_value)
+    if not service or not regions:
+        await target.answer("This platform is not available anymore. Please refresh.", show_alert=True)
+        return
+    await target.answer()
+    text = (
+        f"{html.escape(service['name'])} <b>Platform</b>\n\n"
+        "Select the live region you want to use for this platform."
+    )
+    await safe_edit(target, text, build_service_regions_keyboard(service, regions, page=page))
+
+
+async def prompt_custom_range(target: CallbackQuery, state: FSMContext) -> None:
+    if not await ensure_callback_user(target):
+        return
+    await state.set_state(BuyState.waiting_custom_range)
+    await target.answer()
+    text = (
+        "🔎 <b>Custom Range Search</b>\n\n"
+        "Send a numeric range prefix such as:\n"
+        "<code>255</code>\n"
+        "<code>22507</code>\n"
+        "<code>26134</code>\n\n"
+        "I will search the live provider ranges and show the matches as inline buttons."
+    )
+    await safe_edit(target, text, build_custom_range_prompt_keyboard())
+
+
+async def show_custom_range_results(
+    target: Message | CallbackQuery, query: str, page: int = 0
+) -> None:
+    session = await get_session()
+    matches = await search_custom_ranges(session, query)
+    if not matches:
+        text = (
+            "🔎 <b>Custom Range Search</b>\n\n"
+            f"No live ranges matched <code>{html.escape(query)}</code>.\n"
+            "Try a shorter or different numeric prefix."
+        )
+        if isinstance(target, CallbackQuery):
+            await target.answer("No matches found.", show_alert=True)
+            await safe_edit(target, text, build_custom_range_prompt_keyboard())
+        else:
+            await target.answer(text, reply_markup=build_custom_range_prompt_keyboard())
+        return
+
+    text = (
+        "🔎 <b>Matching Ranges</b>\n\n"
+        f"Query: <code>{html.escape(query)}</code>\n"
+        f"Matches Found: <b>{len(matches)}</b>\n\n"
+        "Choose a live range to continue."
+    )
+    markup = build_custom_ranges_keyboard(matches, query, page=page)
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        await safe_edit(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+async def show_range_services(target: CallbackQuery, rid: str, page: int = 0) -> None:
+    if not await ensure_callback_user(target):
+        return
+    session = await get_session()
+    range_entry, services = await get_range_services(session, rid)
+    if not range_entry or not services:
+        await target.answer("This custom range is no longer available. Search again.", show_alert=True)
+        return
+    await target.answer()
+    text = (
+        "🔢 <b>Custom Range Selected</b>\n\n"
+        f"🌍 Region: <b>{html.escape(range_entry['region_name'])}</b>\n"
+        f"📶 Range: <code>{range_entry['rid']}</code>\n\n"
+        "Select the service you want for this exact live range."
+    )
+    await safe_edit(target, text, build_range_services_keyboard(range_entry, services, page=page))
+
+
+async def allocate_for_user(target: CallbackQuery, service_token_value: str, region_code: str) -> None:
     if not await ensure_callback_user(target):
         return
     user_id = target.from_user.id
@@ -231,7 +348,7 @@ async def allocate_for_user(target: CallbackQuery, region_code: str, token: str)
     session = await get_session()
     settings = await db.get_settings()
     try:
-        region, service, rid = await pick_rid_for_service(session, region_code, token)
+        service, region, rid = await pick_rid_for_region_service(session, service_token_value, region_code)
         allocated = await allocate_number(session, rid)
     except ProviderAPIError as error:
         await target.answer(str(error), show_alert=True)
@@ -252,8 +369,8 @@ async def allocate_for_user(target: CallbackQuery, region_code: str, token: str)
     )
     text = (
         "📞 <b>Number Allocated</b>\n\n"
-        f"🌍 Region: <b>{region['name']}</b>\n"
-        f"🔹 Service: <b>{service['name']}</b>\n"
+        f"🌍 Region: <b>{html.escape(region['name'])}</b>\n"
+        f"🔹 Service: <b>{html.escape(service['name'])}</b>\n"
         f"📞 Number: <code>+{number}</code>\n"
         f"📌 Status: <b>Waiting for OTP</b>\n"
     )
@@ -264,9 +381,155 @@ async def allocate_for_user(target: CallbackQuery, region_code: str, token: str)
     await safe_edit(target, text, build_order_actions(order))
 
 
+async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str) -> None:
+    if not await ensure_callback_user(target):
+        return
+    user_id = target.from_user.id
+    if await db.count_active_orders(user_id) >= MAX_ACTIVE_ORDERS_PER_USER:
+        await target.answer(
+            f"Active order limit reached. Max allowed is {MAX_ACTIVE_ORDERS_PER_USER}.",
+            show_alert=True,
+        )
+        return
+
+    session = await get_session()
+    settings = await db.get_settings()
+    try:
+        range_entry, service = await pick_service_for_range(session, rid, token)
+        allocated = await allocate_number(session, rid)
+    except ProviderAPIError as error:
+        await target.answer(str(error), show_alert=True)
+        return
+
+    number = normalize_digits(allocated.get("no_plus_number") or allocated.get("full_number") or "")
+    if not number:
+        await target.answer("Provider returned an invalid number.", show_alert=True)
+        return
+
+    price = 0.0 if settings["free_mode"] else float(settings["otp_price"] or DEFAULT_OTP_PRICE)
+    order = await db.create_order(
+        user_id=user_id,
+        number=number,
+        service=service["name"],
+        region=range_entry["region_name"],
+        price=price,
+    )
+    text = (
+        "📞 <b>Number Allocated</b>\n\n"
+        f"🌍 Region: <b>{html.escape(range_entry['region_name'])}</b>\n"
+        f"📶 Range: <code>{rid}</code>\n"
+        f"🔹 Service: <b>{html.escape(service['name'])}</b>\n"
+        f"📞 Number: <code>+{number}</code>\n"
+        f"📌 Status: <b>Waiting for OTP</b>\n"
+    )
+    if price > 0:
+        text += f"💳 Unlock Price: <b>{format_currency(price)}</b>\n"
+    else:
+        text += "🎁 Free Mode: <b>OTP will be delivered automatically</b>\n"
+    await target.answer()
+    await safe_edit(target, text, build_order_actions(order))
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message) -> None:
     await show_home(message)
+
+
+@router.message(F.text == "🏠 Home")
+async def home_text_handler(message: Message) -> None:
+    await show_home(message)
+
+
+@router.message(F.text == "📞 Get Number")
+async def buy_text_handler(message: Message) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    session = await get_session()
+    try:
+        services = await get_services(session)
+    except ProviderAPIError as error:
+        await message.answer(str(error), reply_markup=build_home_keyboard(is_admin(message.from_user.id)))
+        return
+    if not services:
+        await message.answer(
+            "No live platforms are available right now.",
+            reply_markup=build_home_keyboard(is_admin(message.from_user.id)),
+        )
+        return
+    text = (
+        "📱 <b>Select Platform</b>\n\n"
+        "Choose the platform first, then select a live region for that platform."
+    )
+    await message.answer(text, reply_markup=build_platforms_keyboard(services, page=0))
+
+
+@router.message(F.text == "🔎 Custom Range")
+async def custom_range_text_handler(message: Message, state: FSMContext) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    await state.set_state(BuyState.waiting_custom_range)
+    text = (
+        "🔎 <b>Custom Range Search</b>\n\n"
+        "Send a numeric range prefix such as:\n"
+        "<code>255</code>\n"
+        "<code>22507</code>\n"
+        "<code>26134</code>\n\n"
+        "I will search the live provider ranges and show the matches as inline buttons."
+    )
+    await message.answer(text, reply_markup=build_custom_range_prompt_keyboard())
+
+
+@router.message(F.text == "💰 Wallet")
+async def wallet_text_handler(message: Message) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    balance = await db.get_balance(message.from_user.id)
+    await message.answer(
+        format_wallet(balance),
+        reply_markup=build_home_keyboard(is_admin(message.from_user.id)),
+    )
+
+
+@router.message(F.text == "📦 My Orders")
+async def orders_text_handler(message: Message) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    orders = await db.list_user_orders(message.from_user.id, kind="active")
+    if not orders:
+        text = "📦 <b>Active Orders</b>\n\nNo active orders found yet."
+    else:
+        lines = ["📦 <b>Active Orders</b>\n"]
+        for order in orders:
+            lines.append(
+                f"#{order['order_id']} • {order['service']} • {human_status(order['status'])} • {format_iso(order['created_at'])}"
+            )
+        text = "\n".join(lines)
+    await message.answer(text, reply_markup=build_orders_keyboard(orders, "active"))
+
+
+@router.message(F.text == "🏆 Leaderboard")
+async def leaderboard_text_handler(message: Message) -> None:
+    await show_leaderboard(message)
+
+
+@router.message(F.text == "ℹ️ Help")
+async def help_text_handler(message: Message) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    await message.answer(
+        format_help(),
+        reply_markup=build_home_keyboard(is_admin(message.from_user.id)),
+    )
 
 
 @router.message(Command("admin"))
@@ -282,6 +545,11 @@ async def admin_handler(message: Message) -> None:
         f"Timeout: <b>{settings['order_timeout_minutes']} minutes</b>"
     )
     await message.answer(text, reply_markup=build_admin_menu())
+
+
+@router.message(F.text == "🛠 Admin")
+async def admin_text_handler(message: Message) -> None:
+    await admin_handler(message)
 
 
 @router.message(Command("addbalance"))
@@ -321,9 +589,9 @@ async def help_callback(callback: CallbackQuery) -> None:
     await show_help(callback)
 
 
-@router.callback_query(F.data == "nav:stats")
-async def stats_callback(callback: CallbackQuery) -> None:
-    await show_user_stats(callback)
+@router.callback_query(F.data == "nav:leaderboard")
+async def leaderboard_callback(callback: CallbackQuery) -> None:
+    await show_leaderboard(callback)
 
 
 @router.callback_query(F.data == "nav:orders")
@@ -339,30 +607,53 @@ async def completed_orders_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "buy:start")
 async def buy_start_callback(callback: CallbackQuery) -> None:
-    await show_regions(callback)
+    await show_platforms(callback)
 
 
-@router.callback_query(F.data.startswith("buy:regions:"))
-async def buy_regions_page_callback(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("buy:platforms:"))
+async def buy_platforms_page_callback(callback: CallbackQuery) -> None:
     page = int(callback.data.split(":")[-1])
-    await show_regions(callback, page=page)
+    await show_platforms(callback, page=page)
 
 
-@router.callback_query(F.data == "buy:refresh")
-async def buy_refresh_callback(callback: CallbackQuery) -> None:
-    await show_regions(callback, force_refresh=True)
+@router.callback_query(F.data == "buy:platforms_refresh")
+async def buy_platforms_refresh_callback(callback: CallbackQuery) -> None:
+    await show_platforms(callback, force_refresh=True)
 
 
-@router.callback_query(F.data.startswith("buy:region:"))
-async def buy_region_callback(callback: CallbackQuery) -> None:
-    _, _, region_code, page = callback.data.split(":")
-    await show_services(callback, region_code, page=int(page))
+@router.callback_query(F.data == "buy:custom")
+async def buy_custom_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await prompt_custom_range(callback, state)
 
 
-@router.callback_query(F.data.startswith("buy:service:"))
-async def buy_service_callback(callback: CallbackQuery) -> None:
-    _, _, region_code, token, _page = callback.data.split(":")
-    await allocate_for_user(callback, region_code, token)
+@router.callback_query(F.data.startswith("buy:ranges:"))
+async def buy_custom_ranges_page_callback(callback: CallbackQuery) -> None:
+    _, _, query, page = callback.data.split(":")
+    await show_custom_range_results(callback, query, page=int(page))
+
+
+@router.callback_query(F.data.startswith("buy:platform:"))
+async def buy_platform_callback(callback: CallbackQuery) -> None:
+    _, _, token, page = callback.data.split(":")
+    await show_service_regions(callback, token, page=int(page))
+
+
+@router.callback_query(F.data.startswith("buy:range:"))
+async def buy_range_callback(callback: CallbackQuery) -> None:
+    _, _, rid, page = callback.data.split(":")
+    await show_range_services(callback, rid, page=int(page))
+
+
+@router.callback_query(F.data.startswith("buy:service_region:"))
+async def buy_service_region_callback(callback: CallbackQuery) -> None:
+    _, _, token, region_code, _page = callback.data.split(":")
+    await allocate_for_user(callback, token, region_code)
+
+
+@router.callback_query(F.data.startswith("buy:range_service:"))
+async def buy_range_service_callback(callback: CallbackQuery) -> None:
+    _, _, rid, token, _page = callback.data.split(":")
+    await allocate_for_custom_range(callback, rid, token)
 
 
 @router.callback_query(F.data.startswith("order:view:"))
@@ -631,6 +922,23 @@ async def admin_unban_input(message: Message, state: FSMContext) -> None:
     await db.set_banned(user_id, False)
     await state.clear()
     await message.answer(f"User <code>{user_id}</code> has been unbanned.")
+
+
+@router.message(BuyState.waiting_custom_range)
+async def custom_range_input(message: Message, state: FSMContext) -> None:
+    allowed = await ensure_user_record(message.from_user)
+    if not allowed:
+        await message.answer("🚫 Your access to this bot has been blocked.")
+        return
+    query = normalize_digits(message.text or "")
+    if len(query) < 2:
+        await message.answer(
+            "Send at least 2 digits for the custom range search, for example <code>255</code>.",
+            reply_markup=build_custom_range_prompt_keyboard(),
+        )
+        return
+    await state.clear()
+    await show_custom_range_results(message, query, page=0)
 
 
 @router.message()

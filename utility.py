@@ -2,11 +2,12 @@ import random
 import re
 import zlib
 from datetime import UTC, datetime
+from html import escape
 from time import monotonic
 from typing import Any
 
 import aiohttp
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import CopyTextButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import API_BASE_URL, API_KEY, HTTP_TIMEOUT_SECONDS, LIVEACCESS_CACHE_SECONDS
@@ -170,7 +171,7 @@ async def get_liveaccess(session: aiohttp.ClientSession) -> dict[str, Any]:
 
 
 def build_catalog(payload: dict[str, Any]) -> dict[str, Any]:
-    catalog: dict[str, Any] = {"regions": {}}
+    catalog: dict[str, Any] = {"regions": {}, "ranges": {}}
     services = payload.get("data", {}).get("services", [])
     for service in services:
         sid = service.get("sid")
@@ -180,6 +181,7 @@ def build_catalog(payload: dict[str, Any]) -> dict[str, Any]:
             if not region:
                 continue
             code, flag, name = region
+            rid = trim_range_to_rid(range_value)
             region_entry = catalog["regions"].setdefault(
                 code,
                 {
@@ -191,7 +193,21 @@ def build_catalog(payload: dict[str, Any]) -> dict[str, Any]:
                 },
             )
             region_entry["last_at"] = max(region_entry["last_at"], last_at)
-            region_entry["services"].setdefault(sid, set()).add(trim_range_to_rid(range_value))
+            region_entry["services"].setdefault(sid, set()).add(rid)
+            range_entry = catalog["ranges"].setdefault(
+                rid,
+                {
+                    "rid": rid,
+                    "range": range_value,
+                    "flag": flag,
+                    "region_code": code,
+                    "region_name": name,
+                    "last_at": 0,
+                    "services": set(),
+                },
+            )
+            range_entry["last_at"] = max(range_entry["last_at"], last_at)
+            range_entry["services"].add(sid)
     return catalog
 
 
@@ -200,6 +216,38 @@ async def get_regions(session: aiohttp.ClientSession, force_refresh: bool = Fals
     regions = list(catalog["regions"].values())
     regions.sort(key=lambda item: (-item["last_at"], item["name"]))
     return regions
+
+
+async def get_services(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    catalog = await get_catalog(session)
+    service_map: dict[str, dict[str, Any]] = {}
+    for region in catalog["regions"].values():
+        for service_name, ranges in region["services"].items():
+            entry = service_map.setdefault(
+                service_name,
+                {
+                    "name": service_name,
+                    "token": service_token(service_name),
+                    "last_at": 0,
+                    "regions": set(),
+                    "range_count": 0,
+                },
+            )
+            entry["last_at"] = max(entry["last_at"], region["last_at"])
+            entry["regions"].add(region["code"])
+            entry["range_count"] += len(ranges)
+    services = [
+        {
+            "name": item["name"],
+            "token": item["token"],
+            "last_at": item["last_at"],
+            "regions_count": len(item["regions"]),
+            "range_count": item["range_count"],
+        }
+        for item in service_map.values()
+    ]
+    services.sort(key=lambda item: service_sort_key(item["name"]))
+    return services
 
 
 async def get_catalog(session: aiohttp.ClientSession, force_refresh: bool = False) -> dict[str, Any]:
@@ -235,6 +283,84 @@ async def get_region_services(
     return region, services
 
 
+async def get_service_regions(
+    session: aiohttp.ClientSession, service_token_value: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    catalog = await get_catalog(session)
+    services = await get_services(session)
+    service = next((item for item in services if item["token"] == service_token_value), None)
+    if not service:
+        return None, []
+    regions = []
+    for region in catalog["regions"].values():
+        ranges = region["services"].get(service["name"])
+        if not ranges:
+            continue
+        regions.append(
+            {
+                "code": region["code"],
+                "flag": region["flag"],
+                "name": region["name"],
+                "last_at": region["last_at"],
+                "ranges": sorted(ranges),
+                "rid_count": len(ranges),
+            }
+        )
+    regions.sort(key=lambda item: (-item["last_at"], item["name"]))
+    return service, regions
+
+
+async def search_custom_ranges(
+    session: aiohttp.ClientSession, query: str
+) -> list[dict[str, Any]]:
+    digits = normalize_digits(query)
+    if not digits:
+        return []
+    catalog = await get_catalog(session)
+    matches = [
+        {
+            "rid": item["rid"],
+            "range": item["range"],
+            "flag": item["flag"],
+            "region_code": item["region_code"],
+            "region_name": item["region_name"],
+            "last_at": item["last_at"],
+            "services_count": len(item["services"]),
+        }
+        for item in catalog["ranges"].values()
+        if item["rid"].startswith(digits)
+    ]
+    matches.sort(key=lambda item: (-item["last_at"], item["rid"]))
+    return matches
+
+
+async def get_range_services(
+    session: aiohttp.ClientSession, rid: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    catalog = await get_catalog(session)
+    range_entry = catalog["ranges"].get(rid)
+    if not range_entry:
+        return None, []
+    services = [
+        {
+            "name": service_name,
+            "token": service_token(service_name),
+        }
+        for service_name in sorted(range_entry["services"], key=service_sort_key)
+    ]
+    return (
+        {
+            "rid": range_entry["rid"],
+            "range": range_entry["range"],
+            "flag": range_entry["flag"],
+            "region_code": range_entry["region_code"],
+            "region_name": range_entry["region_name"],
+            "last_at": range_entry["last_at"],
+        },
+        services,
+    )
+
+
 def service_sort_key(service_name: str) -> tuple[int, str]:
     upper = service_name.upper()
     if upper in PRIORITY_SERVICES:
@@ -253,6 +379,31 @@ async def pick_rid_for_service(
         raise ProviderAPIError("Selected service is no longer available.")
     rid = random.choice(service["ranges"])
     return region, service, rid
+
+
+async def pick_rid_for_region_service(
+    session: aiohttp.ClientSession, service_token_value: str, region_code: str
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    service, regions = await get_service_regions(session, service_token_value)
+    if not service:
+        raise ProviderAPIError("Selected platform is no longer available.")
+    region = next((item for item in regions if item["code"] == region_code), None)
+    if not region:
+        raise ProviderAPIError("Selected region is no longer available for this platform.")
+    rid = random.choice(region["ranges"])
+    return service, region, rid
+
+
+async def pick_service_for_range(
+    session: aiohttp.ClientSession, rid: str, service_token_value: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    range_entry, services = await get_range_services(session, rid)
+    if not range_entry:
+        raise ProviderAPIError("Selected range is no longer available.")
+    service = next((item for item in services if item["token"] == service_token_value), None)
+    if not service:
+        raise ProviderAPIError("Selected service is no longer available for this range.")
+    return range_entry, service
 
 
 async def allocate_number(session: aiohttp.ClientSession, rid: str) -> dict[str, Any]:
@@ -289,7 +440,7 @@ def format_help() -> str:
     return (
         "ℹ️ <b>Help</b>\n\n"
         "1. Choose <b>Get Number</b>.\n"
-        "2. Pick a region and service.\n"
+        "2. Pick a platform, then choose a live region.\n"
         "3. Wait for the OTP worker to detect your code.\n"
         "4. In paid mode, unlock the OTP from your wallet balance.\n\n"
         "The bot matches OTPs only by the exact allocated number."
@@ -306,6 +457,19 @@ def format_user_stats(stats: dict[str, Any], balance: float) -> str:
     )
 
 
+def format_leaderboard(entries: list[dict[str, Any]], current_user_id: int | None = None) -> str:
+    lines = ["🏆 <b>Top OTP Users</b>", "", "Top 5 users by successful OTPs:"]
+    if not entries:
+        lines.append("")
+        lines.append("No successful OTPs yet.")
+        return "\n".join(lines)
+    for index, entry in enumerate(entries, start=1):
+        name = f"@{entry['username']}" if entry.get("username") else f"User {entry['user_id']}"
+        marker = " ← You" if current_user_id and int(entry["user_id"]) == current_user_id else ""
+        lines.append(f"{index}. <b>{escape(str(name))}</b> — {entry['otp_count']} OTPs{marker}")
+    return "\n".join(lines)
+
+
 def format_admin_stats(stats: dict[str, Any]) -> str:
     return (
         "📊 <b>Admin Statistics</b>\n\n"
@@ -317,12 +481,15 @@ def format_admin_stats(stats: dict[str, Any]) -> str:
 
 
 def format_order_card(order: dict[str, Any], reveal_otp: bool = False) -> str:
+    safe_region = escape(str(order["region"]))
+    safe_service = escape(str(order["service"]))
+    safe_message = escape(str(order["otp_message"])) if order.get("otp_message") else None
     lines = [
         f"📦 <b>Order #{order['order_id']}</b>",
         "",
         f"📞 Number: <code>{format_number(order['number'])}</code>",
-        f"🌍 Region: <b>{order['region']}</b>",
-        f"🔹 Service: <b>{order['service']}</b>",
+        f"🌍 Region: <b>{safe_region}</b>",
+        f"🔹 Service: <b>{safe_service}</b>",
         f"📌 Status: <b>{human_status(order['status'])}</b>",
         f"🕒 Created: <b>{format_iso(order['created_at'])}</b>",
     ]
@@ -332,7 +499,7 @@ def format_order_card(order: dict[str, Any], reveal_otp: bool = False) -> str:
         lines.append(f"💳 Unlock Price: <b>{format_currency(float(order['price']))}</b>")
     if order.get("otp_message"):
         if reveal_otp:
-            lines.append(f"📩 OTP Message: <code>{order['otp_message']}</code>")
+            lines.append(f"📩 OTP Message: <code>{safe_message}</code>")
             if order.get("otp_code"):
                 lines.append(f"🔐 OTP Code: <b>{order['otp_code']}</b>")
         else:
@@ -342,18 +509,29 @@ def format_order_card(order: dict[str, Any], reveal_otp: bool = False) -> str:
     return "\n".join(lines)
 
 
-def build_home_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📞 Get Number", callback_data="buy:start")
-    builder.button(text="💰 Wallet", callback_data="nav:wallet")
-    builder.button(text="📦 My Orders", callback_data="nav:orders")
-    builder.button(text="📊 Statistics", callback_data="nav:stats")
-    builder.button(text="ℹ️ Help", callback_data="nav:help")
-    builder.button(text="🏠 Home", callback_data="nav:home")
+def build_home_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
+    keyboard = [
+        [
+            KeyboardButton(text="📞 Get Number", style="primary"),
+            KeyboardButton(text="🔎 Custom Range", style="success"),
+        ],
+        [
+            KeyboardButton(text="💰 Wallet", style="success"),
+            KeyboardButton(text="📦 My Orders", style="primary"),
+        ],
+        [
+            KeyboardButton(text="🏆 Leaderboard", style="primary"),
+            KeyboardButton(text="ℹ️ Help", style="success"),
+        ],
+    ]
     if is_admin:
-        builder.button(text="🛠 Admin", callback_data="admin:menu")
-    builder.adjust(2, 2, 2, 1)
-    return builder.as_markup()
+        keyboard.append([KeyboardButton(text="🛠 Admin", style="danger")])
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Choose an option",
+    )
 
 
 def paginate(items: list[Any], page: int, page_size: int) -> tuple[list[Any], int]:
@@ -370,16 +548,69 @@ def build_regions_keyboard(regions: list[dict[str, Any]], page: int = 0) -> Inli
         builder.button(
             text=f"{region['flag']} {region['name']}",
             callback_data=f"buy:region:{region['code']}:{page}",
+            style="primary",
         )
     if total_pages > 1:
         if page > 0:
-            builder.button(text="⬅️ Prev", callback_data=f"buy:regions:{page - 1}")
-        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop")
+            builder.button(text="⬅️ Prev", callback_data=f"buy:regions:{page - 1}", style="primary")
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop", style="success")
         if page < total_pages - 1:
-            builder.button(text="Next ➡️", callback_data=f"buy:regions:{page + 1}")
-    builder.button(text="🔄 Refresh", callback_data="buy:refresh")
-    builder.button(text="🏠 Home", callback_data="nav:home")
-    builder.adjust(1, 1, 1, 2)
+            builder.button(text="Next ➡️", callback_data=f"buy:regions:{page + 1}", style="primary")
+    builder.button(text="🔎 Custom Range", callback_data="buy:custom", style="success")
+    builder.button(text="🔄 Refresh", callback_data="buy:refresh", style="success")
+    builder.adjust(1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def build_platforms_keyboard(services: list[dict[str, Any]], page: int = 0) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    chunk, total_pages = paginate(services, page, 8)
+    for service in chunk:
+        builder.button(
+            text=f"{service_emoji(service['name'])} {service['name']}",
+            callback_data=f"buy:platform:{service['token']}:{page}",
+            style="primary",
+        )
+    if total_pages > 1:
+        if page > 0:
+            builder.button(text="⬅️ Prev", callback_data=f"buy:platforms:{page - 1}", style="primary")
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop", style="success")
+        if page < total_pages - 1:
+            builder.button(text="Next ➡️", callback_data=f"buy:platforms:{page + 1}", style="primary")
+    builder.button(text="🔄 Refresh", callback_data="buy:platforms_refresh", style="success")
+    builder.button(text="🔎 Custom Range", callback_data="buy:custom", style="success")
+    builder.adjust(1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def build_service_regions_keyboard(
+    service: dict[str, Any], regions: list[dict[str, Any]], page: int = 0
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    chunk, total_pages = paginate(regions, page, 8)
+    for region in chunk:
+        builder.button(
+            text=f"{region['flag']} {region['name']}",
+            callback_data=f"buy:service_region:{service['token']}:{region['code']}:{page}",
+            style="primary",
+        )
+    if total_pages > 1:
+        if page > 0:
+            builder.button(
+                text="⬅️ Prev",
+                callback_data=f"buy:platform:{service['token']}:{page - 1}",
+                style="primary",
+            )
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop", style="success")
+        if page < total_pages - 1:
+            builder.button(
+                text="Next ➡️",
+                callback_data=f"buy:platform:{service['token']}:{page + 1}",
+                style="primary",
+            )
+    builder.button(text="⬅️ Platforms", callback_data="buy:start", style="success")
+    builder.button(text="🔎 Custom Range", callback_data="buy:custom", style="success")
+    builder.adjust(1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -392,32 +623,97 @@ def build_services_keyboard(
         builder.button(
             text=f"{service_emoji(service['name'])} {service['name']}",
             callback_data=f"buy:service:{region['code']}:{service['token']}:{page}",
+            style="primary",
         )
     if total_pages > 1:
         if page > 0:
             builder.button(
                 text="⬅️ Prev", callback_data=f"buy:region:{region['code']}:{page - 1}"
+                , style="primary"
             )
-        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop")
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop", style="success")
         if page < total_pages - 1:
             builder.button(
                 text="Next ➡️", callback_data=f"buy:region:{region['code']}:{page + 1}"
+                , style="primary"
             )
-    builder.button(text="⬅️ Regions", callback_data="buy:start")
-    builder.button(text="🏠 Home", callback_data="nav:home")
-    builder.adjust(1, 1, 1, 2)
+    builder.button(text="⬅️ Regions", callback_data="buy:start", style="success")
+    builder.adjust(1, 1, 1)
+    return builder.as_markup()
+
+
+def build_custom_range_prompt_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Regions", callback_data="buy:start", style="success")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def build_custom_ranges_keyboard(
+    matches: list[dict[str, Any]], query: str, page: int = 0
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    chunk, total_pages = paginate(matches, page, 8)
+    for match in chunk:
+        label = f"{match['flag']} {match['region_name']} • {match['rid']}"
+        builder.button(
+            text=label,
+            callback_data=f"buy:range:{match['rid']}:{page}",
+            style="primary",
+        )
+    if total_pages > 1:
+        if page > 0:
+            builder.button(text="⬅️ Prev", callback_data=f"buy:ranges:{query}:{page - 1}", style="primary")
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop", style="success")
+        if page < total_pages - 1:
+            builder.button(text="Next ➡️", callback_data=f"buy:ranges:{query}:{page + 1}", style="primary")
+    builder.button(text="🔎 Search Again", callback_data="buy:custom", style="success")
+    builder.button(text="⬅️ Regions", callback_data="buy:start", style="success")
+    builder.adjust(1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def build_range_services_keyboard(
+    range_entry: dict[str, Any], services: list[dict[str, Any]], page: int = 0
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    chunk, total_pages = paginate(services, page, 8)
+    for service in chunk:
+        builder.button(
+            text=f"{service_emoji(service['name'])} {service['name']}",
+            callback_data=f"buy:range_service:{range_entry['rid']}:{service['token']}:{page}",
+            style="primary",
+        )
+    if total_pages > 1:
+        if page > 0:
+            builder.button(
+                text="⬅️ Prev", callback_data=f"buy:range:{range_entry['rid']}:{page - 1}"
+                , style="primary"
+            )
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop", style="success")
+        if page < total_pages - 1:
+            builder.button(
+                text="Next ➡️", callback_data=f"buy:range:{range_entry['rid']}:{page + 1}"
+                , style="primary"
+            )
+    builder.button(text="🔎 Custom Range", callback_data="buy:custom", style="success")
+    builder.button(text="⬅️ Regions", callback_data="buy:start", style="success")
+    builder.adjust(1, 1, 1)
     return builder.as_markup()
 
 
 def build_orders_keyboard(orders: list[dict[str, Any]], kind: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for order in orders:
-        builder.button(text=short_order_label(order), callback_data=f"order:view:{order['order_id']}")
+        builder.button(
+            text=short_order_label(order),
+            callback_data=f"order:view:{order['order_id']}",
+            style="primary",
+        )
     if kind == "active":
-        builder.button(text="✅ Completed Orders", callback_data="nav:orders:completed")
+        builder.button(text="✅ Completed Orders", callback_data="nav:orders:completed", style="success")
     else:
-        builder.button(text="⏳ Active Orders", callback_data="nav:orders:active")
-    builder.button(text="🏠 Home", callback_data="nav:home")
+        builder.button(text="⏳ Active Orders", callback_data="nav:orders:active", style="success")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -425,37 +721,67 @@ def build_orders_keyboard(orders: list[dict[str, Any]], kind: str) -> InlineKeyb
 def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if order["status"] == "otp_locked":
-        builder.button(text="💳 Unlock OTP", callback_data=f"order:unlock:{order['order_id']}")
-        builder.button(text="❌ Cancel", callback_data=f"order:cancel:{order['order_id']}")
+        builder.button(
+            text="💳 Unlock OTP",
+            callback_data=f"order:unlock:{order['order_id']}",
+            style="primary",
+        )
+        builder.button(
+            text="❌ Cancel",
+            callback_data=f"order:cancel:{order['order_id']}",
+            style="danger",
+        )
+        builder.button(text="⬅️ Back", callback_data="nav:orders", style="success")
     elif order["status"] == "waiting_otp":
-        builder.button(text="🔄 Refresh", callback_data=f"order:view:{order['order_id']}")
-        builder.button(text="❌ Cancel", callback_data=f"order:cancel:{order['order_id']}")
+        builder.button(
+            text="🔄 Refresh",
+            callback_data=f"order:view:{order['order_id']}",
+            style="success",
+        )
+        builder.button(
+            text="❌ Cancel",
+            callback_data=f"order:cancel:{order['order_id']}",
+            style="danger",
+        )
+        builder.button(text="⬅️ Back", callback_data="nav:orders", style="primary")
     else:
-        builder.button(text="📦 My Orders", callback_data="nav:orders")
-    builder.button(text="🏠 Home", callback_data="nav:home")
+        if order.get("otp_code"):
+            builder.button(
+                text="📋 Copy OTP",
+                copy_text=CopyTextButton(text=str(order["otp_code"])),
+                style="success",
+            )
+        builder.button(text="⬅️ Back", callback_data="nav:orders", style="primary")
     builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def build_leaderboard_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Refresh Leaderboard", callback_data="nav:leaderboard", style="success")
+    builder.button(text="📦 My Orders", callback_data="nav:orders", style="primary")
+    builder.adjust(1, 1)
     return builder.as_markup()
 
 
 def build_admin_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="⚙ Settings", callback_data="admin:settings")
-    builder.button(text="💰 User Balances", callback_data="admin:balances")
-    builder.button(text="📦 Active Orders", callback_data="admin:orders")
-    builder.button(text="📊 Statistics", callback_data="admin:stats")
-    builder.button(text="🚫 Ban User", callback_data="admin:ban")
-    builder.button(text="✅ Unban User", callback_data="admin:unban")
-    builder.button(text="🏠 Home", callback_data="nav:home")
-    builder.adjust(2, 2, 2, 1)
+    builder.button(text="⚙ Settings", callback_data="admin:settings", style="primary")
+    builder.button(text="💰 User Balances", callback_data="admin:balances", style="success")
+    builder.button(text="📦 Active Orders", callback_data="admin:orders", style="primary")
+    builder.button(text="📊 Statistics", callback_data="admin:stats", style="success")
+    builder.button(text="🚫 Ban User", callback_data="admin:ban", style="danger")
+    builder.button(text="✅ Unban User", callback_data="admin:unban", style="success")
+    builder.adjust(2, 2, 2)
     return builder.as_markup()
 
 
 def build_admin_settings(settings: dict[str, Any]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     mode = "ON" if settings["free_mode"] else "OFF"
-    builder.button(text=f"Toggle Free Mode ({mode})", callback_data="admin:toggle_free")
-    builder.button(text="Set OTP Price", callback_data="admin:set_price")
-    builder.button(text="Set Timeout", callback_data="admin:set_timeout")
-    builder.button(text="⬅️ Admin Menu", callback_data="admin:menu")
+    builder.button(text=f"Toggle Free Mode ({mode})", callback_data="admin:toggle_free", style="primary")
+    builder.button(text="Set OTP Price", callback_data="admin:set_price", style="success")
+    builder.button(text="Set Timeout", callback_data="admin:set_timeout", style="primary")
+    builder.button(text="⬅️ Admin Menu", callback_data="admin:menu", style="success")
     builder.adjust(1)
     return builder.as_markup()
