@@ -394,6 +394,7 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
         number=number,
         service=service["name"],
         region=region["name"],
+        rid=rid,
         price=0.0,
     )
     text = (
@@ -436,6 +437,7 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
         number=number,
         service=service["name"],
         region=range_entry["region_name"],
+        rid=rid,
         price=0.0,
     )
     text = (
@@ -731,6 +733,62 @@ async def order_cancel_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     updated = await db.get_order(order_id)
     await safe_edit(callback, format_order_card(updated, reveal_otp=False), build_order_actions(updated))
+
+
+@router.callback_query(F.data.startswith("order:samerange:"))
+async def order_samerange_callback(callback: CallbackQuery) -> None:
+    if not await ensure_callback_user(callback):
+        return
+    user_id = callback.from_user.id
+    order_id = int(callback.data.split(":")[-1])
+    order = await db.get_order_for_user(order_id, user_id, is_admin(user_id))
+    if not order:
+        await callback.answer("Order not found.", show_alert=True)
+        return
+    
+    if not order.get("rid"):
+        await callback.answer("Range ID missing for this order. Cannot allocate same range.", show_alert=True)
+        return
+
+    if not await db.cancel_order(order_id):
+        await callback.answer("Unable to cancel current order.", show_alert=True)
+        return
+
+    if await db.count_active_orders(user_id) >= MAX_ACTIVE_ORDERS_PER_USER:
+        await callback.answer(f"Active order limit reached. Max allowed is {MAX_ACTIVE_ORDERS_PER_USER}.", show_alert=True)
+        return
+
+    session = await get_session()
+    try:
+        allocated = await allocate_number(session, order["rid"])
+    except ProviderAPIError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+
+    number = normalize_digits(allocated.get("no_plus_number") or allocated.get("full_number") or "")
+    if not number:
+        await callback.answer("Provider returned an invalid number.", show_alert=True)
+        return
+
+    new_order = await db.create_order(
+        user_id=user_id,
+        number=number,
+        service=order["service"],
+        region=order["region"],
+        rid=order["rid"],
+        price=0.0,
+    )
+    text = (
+        "📞 <b>Number Allocated</b>\n\n"
+        f"🌍 Region: <b>{html.escape(new_order['region'])}</b>\n"
+        f"📶 Range: <code>{new_order['rid']}</code>\n"
+        f"🔹 Service: <b>{html.escape(new_order['service'])}</b>\n"
+        f"📞 Number: <code>+{number}</code>\n"
+        f"📌 Status: <b>Waiting for OTP</b>\n"
+        f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
+    )
+    await callback.answer("New number allocated!")
+    await safe_edit(callback, text, build_order_actions(new_order))
 
 
 @router.callback_query(F.data.startswith("withdraw:approve:"))

@@ -15,7 +15,7 @@ logger = logging.getLogger("range-notifier")
 
 NOTIFIER_GROUP_ID = "@NEWTON_RENGE_GROUP"
 JSON_FILE = "known_ranges.json"
-CHECK_INTERVAL_SECONDS = 3600  # 1 hour
+CHECK_INTERVAL_SECONDS = 5  # 5 seconds
 SEND_DELAY_SECONDS = 5
 
 

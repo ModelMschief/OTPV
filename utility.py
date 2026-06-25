@@ -746,9 +746,13 @@ def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if order["status"] == "waiting_otp":
         builder.button(
-            text="🔄 Refresh",
-            callback_data=f"order:view:{order['order_id']}",
+            text="🔄 Same Range",
+            callback_data=f"order:samerange:{order['order_id']}",
             style="success",
+        )
+        builder.button(
+            text="💬 OTP Group",
+            url="https://t.me/NEWTON_RENGE_GROUP",
         )
         builder.button(
             text="❌ Cancel",
@@ -756,6 +760,7 @@ def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
             style="danger",
         )
         builder.button(text="⬅️ Back", callback_data="nav:orders", style="primary")
+        builder.adjust(2, 1, 1)
     else:
         if order.get("otp_code"):
             builder.button(

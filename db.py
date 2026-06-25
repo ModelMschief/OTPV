@@ -104,6 +104,7 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_withdrawals_status_created ON withdrawals(status, created_at)"
             )
             self._ensure_column_sync("users", "wallet_address", "TEXT")
+            self._ensure_column_sync("orders", "rid", "TEXT")
             self.conn.commit()
 
     def _ensure_column_sync(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -239,26 +240,27 @@ class Database:
         number: str,
         service: str,
         region: str,
+        rid: str,
         price: float,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._create_order_sync, user_id, number, service, region, price
+            self._create_order_sync, user_id, number, service, region, rid, price
         )
 
     def _create_order_sync(
-        self, user_id: int, number: str, service: str, region: str, price: float
+        self, user_id: int, number: str, service: str, region: str, rid: str, price: float
     ) -> dict[str, Any]:
         now = utc_now_iso()
         with self.lock:
             cursor = self.conn.execute(
                 """
                 INSERT INTO orders (
-                    user_id, number, service, region, status, otp_message, otp_code,
+                    user_id, number, service, region, rid, status, otp_message, otp_code,
                     price, provider_otp_id, created_at, completed_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 'waiting_otp', NULL, NULL, ?, NULL, ?, NULL, ?)
+                VALUES (?, ?, ?, ?, ?, 'waiting_otp', NULL, NULL, ?, NULL, ?, NULL, ?)
                 """,
-                (user_id, number, service, region, price, now, now),
+                (user_id, number, service, region, rid, price, now, now),
             )
             order_id = cursor.lastrowid
             self.conn.commit()
