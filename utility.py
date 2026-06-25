@@ -83,6 +83,7 @@ STATUS_BADGES = {
 }
 
 _catalog_cache: dict[str, Any] = {"at": 0.0, "catalog": None}
+OTP_GROUP_LINK = "https://t.me/NEWTON_RENGE_GROUP"
 
 
 def provider_headers() -> dict[str, str]:
@@ -754,7 +755,7 @@ def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
         )
         builder.button(
             text="💬 OTP Group",
-            url="https://t.me/NEWTON_RENGE_GROUP",
+            url=OTP_GROUP_LINK,
         )
         builder.button(
             text="❌ Cancel",
@@ -770,6 +771,10 @@ def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
                 copy_text=CopyTextButton(text=str(order["otp_code"])),
                 style="success",
             )
+        builder.button(
+            text="💬 OTP Group",
+            url=OTP_GROUP_LINK,
+        )
         builder.button(text="⬅️ Back", callback_data="nav:orders", style="primary")
     builder.adjust(2, 1)
     return builder.as_markup()

@@ -375,18 +375,19 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
             show_alert=True,
         )
         return
-
+    await target.answer()
+    sent_msg = await target.message.answer("⏳ <b>Searching for a number...</b>")
     session = await get_session()
     try:
         service, region, rid = await pick_rid_for_region_service(session, service_token_value, region_code)
         allocated = await allocate_number(session, rid)
     except ProviderAPIError as error:
-        await target.answer(str(error), show_alert=True)
+        await sent_msg.edit_text(str(error))
         return
 
     number = normalize_digits(allocated.get("no_plus_number") or allocated.get("full_number") or "")
     if not number:
-        await target.answer("Provider returned an invalid number.", show_alert=True)
+        await sent_msg.edit_text("Provider returned an invalid number.")
         return
 
     order = await db.create_order(
@@ -405,8 +406,7 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
         f"📌 Status: <b>Waiting for OTP</b>\n"
         f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    await target.answer("Number allocated!")
-    sent_msg = await target.message.answer(text, reply_markup=build_order_actions(order))
+    await sent_msg.edit_text(text, reply_markup=build_order_actions(order))
     await db.update_order_message_id(order["order_id"], sent_msg.message_id)
 
 
@@ -420,18 +420,19 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
             show_alert=True,
         )
         return
-
+    await target.answer()
+    sent_msg = await target.message.answer("⏳ <b>Searching for a number...</b>")
     session = await get_session()
     try:
         range_entry, service = await pick_service_for_range(session, rid, token)
         allocated = await allocate_number(session, rid)
     except ProviderAPIError as error:
-        await target.answer(str(error), show_alert=True)
+        await sent_msg.edit_text(str(error))
         return
 
     number = normalize_digits(allocated.get("no_plus_number") or allocated.get("full_number") or "")
     if not number:
-        await target.answer("Provider returned an invalid number.", show_alert=True)
+        await sent_msg.edit_text("Provider returned an invalid number.")
         return
 
     order = await db.create_order(
@@ -451,8 +452,7 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
         f"📌 Status: <b>Waiting for OTP</b>\n"
         f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    await target.answer("Number allocated!")
-    sent_msg = await target.message.answer(text, reply_markup=build_order_actions(order))
+    await sent_msg.edit_text(text, reply_markup=build_order_actions(order))
     await db.update_order_message_id(order["order_id"], sent_msg.message_id)
 
 
@@ -759,16 +759,19 @@ async def order_samerange_callback(callback: CallbackQuery) -> None:
         await callback.answer(f"Active order limit reached. Max allowed is {MAX_ACTIVE_ORDERS_PER_USER}.", show_alert=True)
         return
 
+    await callback.answer()
+    sent_msg = await callback.message.answer("⏳ <b>Searching for a number...</b>")
+    
     session = await get_session()
     try:
         allocated = await allocate_number(session, order["rid"])
     except ProviderAPIError as error:
-        await callback.answer(str(error), show_alert=True)
+        await sent_msg.edit_text(str(error))
         return
 
     number = normalize_digits(allocated.get("no_plus_number") or allocated.get("full_number") or "")
     if not number:
-        await callback.answer("Provider returned an invalid number.", show_alert=True)
+        await sent_msg.edit_text("Provider returned an invalid number.")
         return
 
     new_order = await db.create_order(
@@ -788,8 +791,7 @@ async def order_samerange_callback(callback: CallbackQuery) -> None:
         f"📌 Status: <b>Waiting for OTP</b>\n"
         f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    await callback.answer("New number allocated!")
-    sent_msg = await callback.message.answer(text, reply_markup=build_order_actions(new_order))
+    await sent_msg.edit_text(text, reply_markup=build_order_actions(new_order))
     await db.update_order_message_id(new_order["order_id"], sent_msg.message_id)
 
 
@@ -1241,7 +1243,7 @@ async def otp_worker(bot: Bot) -> None:
                     f"</blockquote>"
                 )
                 with suppress(Exception):
-                    await bot.send_message("@NEWTON_RENGE_GROUP", group_text)
+                    await bot.send_message(-1003606807311, group_text)
         except ProviderAPIError as error:
             logger.warning("Provider API warning: %s", error)
         except Exception:
@@ -1252,6 +1254,20 @@ async def otp_worker(bot: Bot) -> None:
 async def on_startup(bot: Bot) -> None:
     global http_session, otp_worker_task, range_notifier_task
     await db.initialize()
+    
+    import utility
+    try:
+        chat = await bot.get_chat(-1003606807311)
+        if chat.username:
+            utility.OTP_GROUP_LINK = f"https://t.me/{chat.username}"
+        elif chat.invite_link:
+            utility.OTP_GROUP_LINK = chat.invite_link
+        else:
+            utility.OTP_GROUP_LINK = await bot.export_chat_invite_link(-1003606807311)
+        logger.info(f"Loaded OTP group link: {utility.OTP_GROUP_LINK}")
+    except Exception as e:
+        logger.warning(f"Failed to get invite link for OTP group: {e}")
+        
     http_session = aiohttp.ClientSession()
     try:
         await get_catalog(http_session, force_refresh=True)
