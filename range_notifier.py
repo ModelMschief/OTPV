@@ -63,41 +63,43 @@ async def _notifier_worker(bot: Bot, session: aiohttp.ClientSession) -> None:
                 
                 new_services = current_services - known_services
                 
-                if new_services:
+                if current_services != known_services:
                     updates_found = True
-                    logger.info(f"Found new services for {rid}: {new_services}")
-                    
-                    flag = range_entry.get("flag", "🌍")
-                    region_name = range_entry.get("region_name", "Unknown")
-                    rid_val = range_entry.get("rid", rid)
-                    
-                    is_new_range = len(known_services) == 0
-                    title = "🌍 <b>New Range Available!</b>" if is_new_range else "🌍 <b>New Platforms Supported!</b>"
-                    
-                    services_str = ", ".join(s.title() for s in current_services)
-                    example_service = list(new_services)[0].title()
-                    example_sms = f"{example_service} code: 84920"
-                    
-                    text = (
-                        f"{title}\n\n"
-                        "<blockquote>"
-                        f"🏳️ <b>Country:</b> {flag} {region_name}\n"
-                        f"🔢 <b>Range:</b> <code>{rid_val}xxx</code>\n"
-                        f"📱 <b>Platforms:</b> {services_str}\n"
-                        f"💬 <b>Example SMS:</b> <i>{example_sms}</i>\n"
-                        "</blockquote>"
-                    )
-                    markup = build_range_message_keyboard(rid_val, region_name)
-                    
-                    try:
-                        await bot.send_message(NOTIFIER_GROUP_ID, text, reply_markup=markup)
-                    except Exception as send_err:
-                        logger.error(f"Failed to send range {rid_val} to group: {send_err}")
-                    
                     known_ranges_dict[rid] = list(current_services)
-                    save_known_ranges(known_ranges_dict)
-                    
-                    await asyncio.sleep(SEND_DELAY_SECONDS)
+
+                    if new_services:
+                        logger.info(f"Found new services for {rid}: {new_services}")
+                        
+                        flag = range_entry.get("flag", "🌍")
+                        region_name = range_entry.get("region_name", "Unknown")
+                        rid_val = range_entry.get("rid", rid)
+                        
+                        is_new_range = len(known_services) == 0
+                        title = "🌍 <b>New Range Available!</b>" if is_new_range else "🌍 <b>New Platforms Supported!</b>"
+                        
+                        services_str = ", ".join(s.title() for s in current_services)
+                        example_service = list(new_services)[0].title()
+                        example_sms = f"{example_service} code: 84920"
+                        
+                        text = (
+                            f"{title}\n\n"
+                            "<blockquote>"
+                            f"🏳️ <b>Country:</b> {flag} {region_name}\n"
+                            f"🔢 <b>Range:</b> <code>{rid_val}xxx</code>\n"
+                            f"📱 <b>Platforms:</b> {services_str}\n"
+                            f"💬 <b>Example SMS:</b> <i>{example_sms}</i>\n"
+                            "</blockquote>"
+                        )
+                        markup = build_range_message_keyboard(rid_val, region_name)
+                        
+                        try:
+                            await bot.send_message(NOTIFIER_GROUP_ID, text, reply_markup=markup)
+                            await asyncio.sleep(SEND_DELAY_SECONDS)
+                        except Exception as send_err:
+                            logger.error(f"Failed to send range {rid_val} to group: {send_err}")
+            
+            if updates_found:
+                save_known_ranges(known_ranges_dict)
                     
             if updates_found:
                 logger.info("Finished posting range updates.")
