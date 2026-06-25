@@ -36,6 +36,7 @@ COUNTRY_PREFIXES = {
     "229": ("🇧🇯", "Benin"),
     "228": ("🇹🇬", "Togo"),
     "225": ("🇨🇮", "Côte d'Ivoire"),
+    "224": ("🇬🇳", "Guinea"),
     "223": ("🇲🇱", "Mali"),
     "216": ("🇹🇳", "Tunisia"),
     "996": ("🇰🇬", "Kyrgyzstan"),
@@ -121,7 +122,8 @@ def detect_region(range_value: str) -> tuple[str, str, str] | None:
         if digits.startswith(prefix):
             flag, name = COUNTRY_PREFIXES[prefix]
             return prefix, flag, name
-    return None
+    rid = trim_range_to_rid(range_value)
+    return rid, "🌍", f"Region +{rid}"
 
 
 def service_token(service_name: str) -> str:

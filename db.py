@@ -105,6 +105,7 @@ class Database:
             )
             self._ensure_column_sync("users", "wallet_address", "TEXT")
             self._ensure_column_sync("orders", "rid", "TEXT")
+            self._ensure_column_sync("orders", "message_id", "INTEGER")
             self.conn.commit()
 
     def _ensure_column_sync(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -242,13 +243,14 @@ class Database:
         region: str,
         rid: str,
         price: float,
+        message_id: int | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._create_order_sync, user_id, number, service, region, rid, price
+            self._create_order_sync, user_id, number, service, region, rid, price, message_id
         )
 
     def _create_order_sync(
-        self, user_id: int, number: str, service: str, region: str, rid: str, price: float
+        self, user_id: int, number: str, service: str, region: str, rid: str, price: float, message_id: int | None = None
     ) -> dict[str, Any]:
         now = utc_now_iso()
         with self.lock:
@@ -256,11 +258,11 @@ class Database:
                 """
                 INSERT INTO orders (
                     user_id, number, service, region, rid, status, otp_message, otp_code,
-                    price, provider_otp_id, created_at, completed_at, updated_at
+                    price, provider_otp_id, created_at, completed_at, updated_at, message_id
                 )
-                VALUES (?, ?, ?, ?, ?, 'waiting_otp', NULL, NULL, ?, NULL, ?, NULL, ?)
+                VALUES (?, ?, ?, ?, ?, 'waiting_otp', NULL, NULL, ?, NULL, ?, NULL, ?, ?)
                 """,
-                (user_id, number, service, region, rid, price, now, now),
+                (user_id, number, service, region, rid, price, now, now, message_id),
             )
             order_id = cursor.lastrowid
             self.conn.commit()
@@ -268,6 +270,17 @@ class Database:
                 "SELECT * FROM orders WHERE order_id = ?", (order_id,)
             ).fetchone()
         return dict(row)
+
+    async def update_order_message_id(self, order_id: int, message_id: int) -> None:
+        await asyncio.to_thread(self._update_order_message_id_sync, order_id, message_id)
+
+    def _update_order_message_id_sync(self, order_id: int, message_id: int) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE orders SET message_id = ? WHERE order_id = ?",
+                (message_id, order_id),
+            )
+            self.conn.commit()
 
     async def get_order(self, order_id: int) -> dict[str, Any] | None:
         return await asyncio.to_thread(

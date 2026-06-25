@@ -405,7 +405,9 @@ async def allocate_for_user(target: CallbackQuery, service_token_value: str, reg
         f"📌 Status: <b>Waiting for OTP</b>\n"
         f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    await safe_edit(target, text, build_order_actions(order))
+    await target.answer("Number allocated!")
+    sent_msg = await target.message.answer(text, reply_markup=build_order_actions(order))
+    await db.update_order_message_id(order["order_id"], sent_msg.message_id)
 
 
 async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str) -> None:
@@ -449,8 +451,9 @@ async def allocate_for_custom_range(target: CallbackQuery, rid: str, token: str)
         f"📌 Status: <b>Waiting for OTP</b>\n"
         f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
-    await target.answer()
-    await safe_edit(target, text, build_order_actions(order))
+    await target.answer("Number allocated!")
+    sent_msg = await target.message.answer(text, reply_markup=build_order_actions(order))
+    await db.update_order_message_id(order["order_id"], sent_msg.message_id)
 
 
 @router.message(CommandStart())
@@ -750,9 +753,7 @@ async def order_samerange_callback(callback: CallbackQuery) -> None:
         await callback.answer("Range ID missing for this order. Cannot allocate same range.", show_alert=True)
         return
 
-    if not await db.cancel_order(order_id):
-        await callback.answer("Unable to cancel current order.", show_alert=True)
-        return
+    # Do not cancel the old order so they can wait concurrently
 
     if await db.count_active_orders(user_id) >= MAX_ACTIVE_ORDERS_PER_USER:
         await callback.answer(f"Active order limit reached. Max allowed is {MAX_ACTIVE_ORDERS_PER_USER}.", show_alert=True)
@@ -788,7 +789,8 @@ async def order_samerange_callback(callback: CallbackQuery) -> None:
         f"🎁 Reward After OTP: <b>{format_currency(OTP_REWARD_BDT)}</b>\n"
     )
     await callback.answer("New number allocated!")
-    await safe_edit(callback, text, build_order_actions(new_order))
+    sent_msg = await callback.message.answer(text, reply_markup=build_order_actions(new_order))
+    await db.update_order_message_id(new_order["order_id"], sent_msg.message_id)
 
 
 @router.callback_query(F.data.startswith("withdraw:approve:"))
@@ -1214,11 +1216,32 @@ async def otp_worker(bot: Bot) -> None:
                     f"🕒 Received: <b>{format_unix_ms(int(otp.get('time', 0)))}</b>"
                 )
                 with suppress(Exception):
-                    await bot.send_message(
-                        order["user_id"],
-                        text,
-                        reply_markup=build_order_actions(order),
-                    )
+                    if order.get("message_id"):
+                        await bot.edit_message_text(
+                            chat_id=order["user_id"],
+                            message_id=order["message_id"],
+                            text=text,
+                            reply_markup=build_order_actions(order),
+                        )
+                    else:
+                        await bot.send_message(
+                            order["user_id"],
+                            text,
+                            reply_markup=build_order_actions(order),
+                        )
+                
+                # Send to group
+                group_text = (
+                    f"✅ <b>OTP Arrived!</b>\n\n"
+                    f"<blockquote>"
+                    f"🌍 <b>Region:</b> {html.escape(order['region'])}\n"
+                    f"🔢 <b>Range:</b> <code>{order.get('rid', 'Unknown')}xxx</code>\n"
+                    f"🔹 <b>Service:</b> {html.escape(order['service'])}\n"
+                    f"💬 <b>SMS:</b> <i>{html.escape(message)}</i>\n"
+                    f"</blockquote>"
+                )
+                with suppress(Exception):
+                    await bot.send_message("@NEWTON_RENGE_GROUP", group_text)
         except ProviderAPIError as error:
             logger.warning("Provider API warning: %s", error)
         except Exception:
