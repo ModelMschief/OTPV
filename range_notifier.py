@@ -19,22 +19,22 @@ CHECK_INTERVAL_SECONDS = 3600  # 1 hour
 SEND_DELAY_SECONDS = 5
 
 
-def load_known_ranges() -> set[str]:
+def load_known_ranges() -> dict[str, list[str]]:
     if not os.path.exists(JSON_FILE):
-        return set()
+        return {}
     try:
         with open(JSON_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return set(data.get("known_rids", []))
+            return data.get("known_ranges", {})
     except Exception as e:
         logger.error(f"Failed to load known ranges: {e}")
-        return set()
+        return {}
 
 
-def save_known_ranges(known_rids: set[str]) -> None:
+def save_known_ranges(known_ranges: dict[str, list[str]]) -> None:
     try:
         with open(JSON_FILE, "w", encoding="utf-8") as f:
-            json.dump({"known_rids": list(known_rids)}, f)
+            json.dump({"known_ranges": known_ranges}, f)
     except Exception as e:
         logger.error(f"Failed to save known ranges: {e}")
 
@@ -51,34 +51,35 @@ async def _notifier_worker(bot: Bot, session: aiohttp.ClientSession) -> None:
     logger.info("Range notifier worker started.")
     while True:
         try:
-            known_rids = load_known_ranges()
+            known_ranges_dict = load_known_ranges()
             catalog = await get_catalog(session, force_refresh=True)
             ranges_data = catalog.get("ranges", {})
-            current_rids = set(ranges_data.keys())
-
-            new_rids = current_rids - known_rids
-
-            if new_rids:
-                logger.info(f"Found {len(new_rids)} new ranges to post.")
+            
+            updates_found = False
+            
+            for rid, range_entry in ranges_data.items():
+                current_services = set(range_entry.get("services", []))
+                known_services = set(known_ranges_dict.get(rid, []))
                 
-                for rid in sorted(list(new_rids)):
-                    range_entry = ranges_data[rid]
+                new_services = current_services - known_services
+                
+                if new_services:
+                    updates_found = True
+                    logger.info(f"Found new services for {rid}: {new_services}")
+                    
                     flag = range_entry.get("flag", "🌍")
                     region_name = range_entry.get("region_name", "Unknown")
                     rid_val = range_entry.get("rid", rid)
-                    services_list = list(range_entry.get("services", []))
                     
-                    if services_list:
-                        services_str = ", ".join(s.title() for s in services_list)
-                        example_service = services_list[0].title()
-                    else:
-                        services_str = "Any Supported Service"
-                        example_service = "App"
-                        
+                    is_new_range = len(known_services) == 0
+                    title = "🌍 <b>New Range Available!</b>" if is_new_range else "🌍 <b>New Platforms Supported!</b>"
+                    
+                    services_str = ", ".join(s.title() for s in current_services)
+                    example_service = list(new_services)[0].title()
                     example_sms = f"{example_service} code: 84920"
                     
                     text = (
-                        "🌍 <b>New Range Available!</b>\n\n"
+                        f"{title}\n\n"
                         "<blockquote>"
                         f"🏳️ <b>Country:</b> {flag} {region_name}\n"
                         f"🔢 <b>Range:</b> <code>{rid_val}xxx</code>\n"
@@ -93,14 +94,15 @@ async def _notifier_worker(bot: Bot, session: aiohttp.ClientSession) -> None:
                     except Exception as send_err:
                         logger.error(f"Failed to send range {rid_val} to group: {send_err}")
                     
-                    known_rids.add(rid)
-                    save_known_ranges(known_rids)
+                    known_ranges_dict[rid] = list(current_services)
+                    save_known_ranges(known_ranges_dict)
                     
                     await asyncio.sleep(SEND_DELAY_SECONDS)
-                
-                logger.info("Finished posting new ranges.")
+                    
+            if updates_found:
+                logger.info("Finished posting range updates.")
             else:
-                logger.debug("No new ranges found.")
+                logger.debug("No new range updates found.")
                 
         except Exception as e:
             logger.exception("Unexpected error in range notifier worker.")

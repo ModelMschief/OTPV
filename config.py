@@ -3,7 +3,7 @@ BOT_TOKEN = "8670560280:AAG7qMFvsn90Xo8sSWml51v96HKHUcSV0hE"
 # Replace with your Telegram numeric user IDs.
 ADMIN_IDS = {7533495029}
 
-API_KEY = "MASP6HHKCNF"
+API_KEY = "M65ZCG1TSHD"
 API_BASE_URL = "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api"
 
 DATABASE_NAME = "otp_marketplace.db"
