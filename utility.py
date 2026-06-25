@@ -775,8 +775,14 @@ def build_order_actions(order: dict[str, Any]) -> InlineKeyboardMarkup:
             text="💬 OTP Group",
             url=OTP_GROUP_LINK,
         )
+        if order.get("otp_code"):
+            builder.button(
+                text="🔄 Get Next OTP",
+                callback_data=f"order:nextotp:{order['order_id']}",
+                style="success",
+            )
         builder.button(text="⬅️ Back", callback_data="nav:orders", style="primary")
-    builder.adjust(2, 1)
+        builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 
